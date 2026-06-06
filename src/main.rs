@@ -25,6 +25,25 @@ struct App {
     pixmap: Pixmap,
     mouse_down: bool,
     last_cursor_position: Option<Point>,
+
+    // egui_ctx: egui::Context,
+    // egui_state: egui_winit::State,
+
+}
+
+impl App {
+    pub fn new() -> Self {
+        let width = 600;
+        let height = 400;
+        App {
+            render_state: RenderState::Suspended,
+            renderer: RenderContext::new(width, height),
+            resources: Resources::new(),
+            pixmap: Pixmap::new(width, height),
+            mouse_down: false,
+            last_cursor_position: None,
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -121,21 +140,8 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-
-    let width = 600;
-    let height = 400;
-    let mut app = App {
-        render_state: RenderState::Suspended,
-        renderer: RenderContext::new(width, height),
-        resources: Resources::new(),
-        pixmap: Pixmap::new(width, height),
-        mouse_down: false,
-        last_cursor_position: None,
-    };
-
     let event_loop = EventLoop::new().unwrap();
     event_loop
-        .run_app(&mut app)
+        .run_app(&mut App::new())
         .expect("Couldn't run event loop");
-
 }

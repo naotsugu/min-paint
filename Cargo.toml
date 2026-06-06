@@ -9,3 +9,6 @@ vello_common = "0.0.9"
 vello_cpu = "0.0.9"
 softbuffer = "0.4.8"
 image = "0.25.10"
+
+egui = "0.34.3"
+egui-winit = { version = "0.34.3", default-features = false }
