@@ -3,12 +3,12 @@ use std::num::NonZeroU32;
 use vello_common::pixmap::Pixmap;
 use vello_cpu::{RenderContext, Resources};
 use vello_cpu::color::palette::css::{BLUE};
-use vello_cpu::kurbo::{Line, Circle, Rect, Shape};
+use vello_cpu::kurbo::{Line, Shape, Stroke};
 use vello_cpu::kurbo::Point;
 use winit::window::{Window, WindowId};
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 
 enum RenderState {
     Active {
@@ -103,7 +103,8 @@ impl ApplicationHandler for App {
                 if self.mouse_down {
                     if let Some(last_pos) = self.last_cursor_position {
                         self.renderer.set_paint(BLUE);
-                        self.renderer.stroke_path(&Line::new(last_pos, current_pos).to_path(1.0));
+                        self.renderer.set_stroke(Stroke::new(5.0));
+                        self.renderer.stroke_path(&Line::new(last_pos, current_pos).to_path(0.1));
                         self.renderer.flush();
                         window.request_redraw();
                     }
