@@ -14,28 +14,39 @@ enum RenderState {
     Active {
         window: Rc<Window>,
         surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
+        egui_state: egui_winit::State,
     },
     Suspended,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub width: u16,
+    pub height: u16,
+}
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self { width: 600, height: 400,
+        }
+    }
+}
+
 struct App {
+    config: AppConfig,
     render_state: RenderState,
     renderer: RenderContext,
     resources: Resources,
     pixmap: Pixmap,
     mouse_down: bool,
     last_cursor_position: Option<Point>,
-
-    // egui_ctx: egui::Context,
-    // egui_state: egui_winit::State,
-
 }
 
 impl App {
     pub fn new() -> Self {
-        let width = 600;
-        let height = 400;
+        let config = AppConfig::default();
+        let (width, height) = (config.width, config.height);
         App {
+            config: config,
             render_state: RenderState::Suspended,
             renderer: RenderContext::new(width, height),
             resources: Resources::new(),
@@ -64,7 +75,17 @@ impl ApplicationHandler for App {
         let window = Rc::new(event_loop.create_window(window_attrs).unwrap());
         let context = softbuffer::Context::new(window.clone()).unwrap();
         let surface = softbuffer::Surface::new(&context, window.clone()).unwrap();
-        self.render_state = RenderState::Active { window, surface };
+
+        let egui_state = egui_winit::State::new(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+
+        self.render_state = RenderState::Active { window, surface, egui_state };
     }
 
     fn window_event(
@@ -73,7 +94,7 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let RenderState::Active { window, surface } = &mut self.render_state else {
+        let RenderState::Active { window, surface, egui_state } = &mut self.render_state else {
             return;
         };
         if window.id() != window_id {
