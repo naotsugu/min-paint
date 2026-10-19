@@ -1,9 +1,15 @@
 [package]
-name = "min-paint"
+name = "min_paint"
 version = "0.1.0"
 edition = "2024"
+description = "Simple paint application"
+authors = ["Naotsugu Kobayashi <naotsugukobayashi@gmail.com>"]
+homepage = "https://github.com/naotsugu/min-paint"
+documentation = "https://github.com/naotsugu/min-paint"
+repository = "https://github.com/naotsugu/min-paint"
+license = "Apache-2.0"
 
 [dependencies]
-xilem = { git = "https://github.com/linebender/xilem.git" }
-kurbo = "0.13.1"
-
+gpui-kit = "0.7.3"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+rfd = "0.17.2"
