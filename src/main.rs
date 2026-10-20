@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _, Toggle};
 use gpui_kit::component::{ActiveTheme, Icon, IndexPath, Sizable};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dialog::DialogFooter;
+use gpui_kit::component::tooltip::Tooltip;
 
 // palette (column-major pairs: top row, bottom row)
 const PALETTE: [u32; 20] = [
@@ -32,6 +33,8 @@ const PALETTE: [u32; 20] = [
 const BRUSH_SIZES: [&str; 16] = [
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "12", "16", "24", "32", "48", "64",
 ];
+
+const DEFAULT_CANVAS_SIZE: (usize, usize) = (600, 500);
 
 const SIDEBAR_WIDTH: f32 = 72.;
 const SWATCH_SIZE: f32 = 16.;
@@ -606,6 +609,8 @@ pub struct Application {
     redo_stack: Vec<Edit>,
     // true when the document has changes that were not saved yet
     modified: bool,
+    // file the document was opened from or last saved to (None = Untitled)
+    file_path: Option<PathBuf>,
     tool: Tool,
     drag: Drag,
     // last pixel touched while dragging (canvas coordinates)
@@ -650,7 +655,7 @@ impl Application {
         let size_select = cx.new(|cx| {
             SelectState::new(
                 SearchableVec::new(BRUSH_SIZES.to_vec()),
-                Some(IndexPath::new(0)),
+                Some(IndexPath::new(2)),
                 window,
                 cx,
             )
@@ -711,7 +716,7 @@ impl Application {
             }
         });
 
-        let bitmap = Bitmap::new(600, 500, BACKGROUND);
+        let bitmap = Bitmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
 
         // ask about unsaved changes when the window is about to close (X button, Alt+F4, ...);
         // returning false from the callback keeps the window open
@@ -726,10 +731,11 @@ impl Application {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             modified: false,
+            file_path: None,
             tool: Tool::Pencil,
             drag: Drag::None,
             last_pos: (0, 0),
-            brush_size: 1,
+            brush_size: 3,
             shape_filled: false,
             antialias: false,
             coverage: None,
@@ -1656,7 +1662,8 @@ impl Application {
                 "y" => self.redo(window, cx),
                 "c" => self.copy_selection(cx),
                 "v" => self.paste_image(window, cx),
-                "s" => { self.save_png(cx); }
+                "s" => { self.save_png(key.modifiers.shift, cx); }
+                "n" => self.new_document(window, cx),
                 "o" => self.open_png(window, cx),
                 _ => {}
             }
@@ -1669,20 +1676,41 @@ impl Application {
 
     // -- files ---------------------------------------------------------------
 
-    // returns true when the image was saved
-    fn save_png(&mut self, cx: &mut Context<Self>) -> bool {
+    // returns true when the image was saved;
+    // `save_as` forces the file dialog even if the document already has a path
+    fn save_png(&mut self, save_as: bool, cx: &mut Context<Self>) -> bool {
         // make sure a moved selection is part of the saved image
         self.commit_selection();
         self.drag = Drag::None;
 
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("PNG image", &["png"])
-            .set_file_name("drawing.png")
-            .save_file()
-        else {
-            return false; // canceled
+        // overwrite the current file directly, but only when it is a PNG
+        let existing = self.file_path.clone().filter(|p| {
+            !save_as && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))
+        });
+        let path = match existing {
+            Some(path) => path,
+            None => {
+                let mut dialog = rfd::FileDialog::new().add_filter("PNG image", &["png"]);
+                // start from the current file's folder and name (with a .png extension)
+                dialog = match &self.file_path {
+                    Some(p) => {
+                        let name = p
+                            .file_stem()
+                            .map(|s| format!("{}.png", s.to_string_lossy()))
+                            .unwrap_or_else(|| "drawing.png".to_string());
+                        if let Some(dir) = p.parent() {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog.set_file_name(name)
+                    }
+                    None => dialog.set_file_name("drawing.png"),
+                };
+                let Some(path) = dialog.save_file() else {
+                    return false; // canceled
+                };
+                if path.extension().is_none() { path.with_extension("png") } else { path }
+            }
         };
-        let path = if path.extension().is_none() { path.with_extension("png") } else { path };
 
         let data: Vec<u8> = self.bitmap.pixels.iter().flatten().copied().collect();
         let Some(img) = image::RgbaImage::from_raw(self.bitmap.width as u32, self.bitmap.height as u32, data) else {
@@ -1693,6 +1721,7 @@ impl Application {
             show_error(&format!("Failed to save the image: {e}"));
             return false;
         }
+        self.file_path = Some(path);
         self.modified = false;
         self.mark_dirty();
         cx.notify();
@@ -1725,10 +1754,23 @@ impl Application {
             .set_buttons(rfd::MessageButtons::YesNoCancel)
             .show();
         match answer {
-            rfd::MessageDialogResult::Yes => self.save_png(cx), // a canceled save aborts too
+            rfd::MessageDialogResult::Yes => self.save_png(false, cx), // a canceled save aborts too
             rfd::MessageDialogResult::No => true,
             _ => false,
         }
+    }
+
+    // start a new, empty document (asks about unsaved changes first)
+    fn new_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.confirm_discard(cx) {
+            return;
+        }
+        let bitmap = Bitmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
+        // a new document has no history and no file name
+        self.replace_bitmap(bitmap, false);
+        self.file_path = None;
+        self.scroll = (0., 0.);
+        self.after_history_change(window, cx);
     }
 
     // open an image file as a new document (used by the Open dialog and by file drops)
@@ -1759,6 +1801,7 @@ impl Application {
         // opening a file starts a new document: the history is cleared
         let bitmap = Bitmap { width: width as usize, height: height as usize, pixels, dirty: None };
         self.replace_bitmap(bitmap, false);
+        self.file_path = Some(path.to_path_buf());
         self.scroll = (0., 0.);
         self.after_history_change(window, cx);
     }
@@ -1786,12 +1829,18 @@ impl Application {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
 
+        let new_button = Button::new("btn-new")
+            .ghost().small().icon(IconName::File).tooltip("New (Ctrl+N)")
+            .on_click(cx.listener(|this, _, window, cx| this.new_document(window, cx)));
         let open_button = Button::new("btn-open")
             .ghost().small().icon(IconName::FolderOpen).tooltip("Open (Ctrl+O)")
             .on_click(cx.listener(|this, _, window, cx| this.open_png(window, cx)));
         let save_button = Button::new("btn-save")
             .ghost().small().icon(IconName::Save).tooltip("Save (Ctrl+S)")
-            .on_click(cx.listener(|this, _, _, cx| { this.save_png(cx); }));
+            .on_click(cx.listener(|this, _, _, cx| { this.save_png(false, cx); }));
+        let save_as_button = Button::new("btn-save-as")
+            .ghost().small().icon(IconName::SaveCheck).tooltip("Save As (Ctrl+Shift+S)")
+            .on_click(cx.listener(|this, _, _, cx| { this.save_png(true, cx); }));
         let undo_button = Button::new("btn-undo")
             .ghost().small().icon(IconName::Undo2).tooltip("Undo (Ctrl+Z)")
             .on_click(cx.listener(|this, _, window, cx| this.undo(window, cx)));
@@ -1805,8 +1854,10 @@ impl Application {
             .flex_row()
             .flex_wrap()
             .gap(px(2.))
+            .child(new_button)
             .child(open_button)
             .child(save_button)
+            .child(save_as_button)
             .child(undo_button)
             .child(redo_button);
 
@@ -1919,6 +1970,21 @@ impl Application {
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+
+        // file name for the footer (the full path goes into the tooltip)
+        let full_path = self
+            .file_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "Untitled (not saved yet)".to_string());
+        let base_name = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".to_string());
+        let file_text = if self.modified { format!("*{base_name}") } else { base_name };
+
         let size_text = format!("{} × {} px", self.bitmap.width, self.bitmap.height);
         let cursor_text = self
             .cursor_px
@@ -1955,10 +2021,19 @@ impl Application {
             .child(div().w(px(110.)).text_xs().child(size_text))
             .child(div().w(px(80.)).text_xs().child(cursor_text))
             .child(div().w(px(110.)).text_xs().child(selection_text))
-            .child(div().flex_1())
+            .child(
+                div()
+                    .id("file-name")
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .child(file_text)
+                    .tooltip(move |window, cx| Tooltip::new(full_path.clone()).build(window, cx)),
+            )
             // zoom
             .child(div().text_xs().child("Zoom"))
-            .child(Slider::new(&self.zoom_slider).w(px(140.)))
+            .child(Slider::new(&self.zoom_slider))
             .child(fit_button)
             .child(
                 div()
