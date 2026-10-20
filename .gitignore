@@ -5,6 +5,7 @@
 !.gitmodules
 !.editorconfig
 !.github/
+!.cargo
 
 # will have compiled files and executables
 debug

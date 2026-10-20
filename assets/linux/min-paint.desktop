@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=min-paint
+Comment=Minimal paint application
+Exec=min-paint
+Icon=min-paint
+Terminal=false
+Categories=Utility;
+StartupWMClass=min-paint

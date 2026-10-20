@@ -2,7 +2,7 @@
 name = "min_paint"
 version = "0.1.0"
 edition = "2024"
-description = "Simple paint application"
+description = "Minimal paint application"
 authors = ["Naotsugu Kobayashi <naotsugukobayashi@gmail.com>"]
 homepage = "https://github.com/naotsugu/min-paint"
 documentation = "https://github.com/naotsugu/min-paint"
@@ -11,5 +11,36 @@ license = "Apache-2.0"
 
 [dependencies]
 gpui-kit = "0.7.3"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false,
+    features = ["png", "bmp", "gif", "ico", "jpeg", "webp"] }
 rfd = "0.17.2"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+# ---- Packaging metadata (consumed by external tools) ----
+
+# cargo-bundle (macOS .app / Linux .deb)
+[package.metadata.bundle]
+name = "min-paint"
+identifier = "com.mammb.min-paint"
+icon = ["assets/macos/app.icns", "assets/linux/min-paint.png"]
+category = "Utility"
+short_description = "Minimal paint application"
+
+# cargo-deb
+[package.metadata.deb]
+section = "utils"
+assets = [
+    ["target/release/min-paint", "usr/bin/", "755"],
+    ["assets/linux/min-paint.desktop", "usr/share/applications/", "644"],
+    ["assets/linux/min-paint.png", "usr/share/icons/hicolor/256x256/apps/min-paint.png", "644"],
+]
+
