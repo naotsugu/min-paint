@@ -37,6 +37,9 @@ const SIDEBAR_WIDTH: f32 = 72.;
 const SWATCH_SIZE: f32 = 16.;
 const FOOTER_HEIGHT: f32 = 32.;
 
+const SCROLLBAR_SIZE: f32 = 12.;
+const MIN_THUMB_LEN: f32 = 24.;
+
 // minimum gap between the canvas and the viewport edge when scrolled to an end
 const CANVAS_MARGIN: f32 = 12.;
 
@@ -571,6 +574,28 @@ enum Drag {
     Shape { start: (i32, i32) },
     SelectNew { start: (i32, i32) },
     SelectMove { grab: (i32, i32) },
+    // `grab` is the offset (in logical pixels) between the pointer and the thumb start
+    ScrollbarX { grab: f32 },
+    ScrollbarY { grab: f32 },
+}
+
+/// Geometry of one scrollbar thumb, in logical pixels.
+#[derive(Clone, Copy)]
+struct Thumb {
+    start: f32,  // thumb offset inside the track
+    len: f32,    // thumb length
+    track: f32,  // track length
+    max: f32,    // maximum scroll offset of this axis
+}
+
+fn thumb(content: f32, view: f32, scroll: f32, track: f32) -> Option<Thumb> {
+    let max = content - view;
+    if max <= 0.5 || track <= 0. {
+        return None;
+    }
+    let len = (track * view / content).clamp(MIN_THUMB_LEN.min(track), track);
+    let start = scroll / max * (track - len);
+    Some(Thumb { start, len, track, max })
 }
 
 pub struct Application {
@@ -767,6 +792,54 @@ impl Application {
             self.scroll = clamped;
             self.mark_dirty();
         }
+    }
+
+    // thumbs of the horizontal and vertical scrollbars (None = no scrollbar needed)
+    fn scrollbar_layout(&self) -> (Option<Thumb>, Option<Thumb>) {
+        let (content_w, content_h) = self.content_size(self.zoom());
+        let view_w = f32::from(self.viewport_size.width);
+        let view_h = f32::from(self.viewport_size.height);
+        let need_x = content_w - view_w > 0.5;
+        let need_y = content_h - view_h > 0.5;
+        // shorten the tracks so that the two bars do not overlap in the corner
+        let track_x = view_w - if need_y { SCROLLBAR_SIZE } else { 0. };
+        let track_y = view_h - if need_x { SCROLLBAR_SIZE } else { 0. };
+        (
+            thumb(content_w, view_w, self.scroll.0, track_x),
+            thumb(content_h, view_h, self.scroll.1, track_y),
+        )
+    }
+
+    // move the scroll position so that the thumb follows the pointer
+    // (`pos` is the pointer position along the axis, in viewport coordinates)
+    fn set_scroll_from_thumb(&mut self, vertical: bool, pos: f32, grab: f32) {
+        let (x, y) = self.scrollbar_layout();
+        let Some(t) = (if vertical { y } else { x }) else { return };
+        let travel = t.track - t.len;
+        if travel <= 0. {
+            return;
+        }
+        let start = (pos - grab).clamp(0., travel);
+        let scroll = start / travel * t.max;
+        if vertical {
+            self.scroll.1 = scroll;
+        } else {
+            self.scroll.0 = scroll;
+        }
+        self.mark_dirty();
+    }
+
+    // mouse down on a scrollbar track: grab the thumb, or center it on the pointer
+    fn start_scrollbar_drag(&mut self, vertical: bool, pos: f32) {
+        let (x, y) = self.scrollbar_layout();
+        let Some(t) = (if vertical { y } else { x }) else { return };
+        let grab = if pos >= t.start && pos <= t.start + t.len {
+            pos - t.start
+        } else {
+            t.len / 2.
+        };
+        self.drag = if vertical { Drag::ScrollbarY { grab } } else { Drag::ScrollbarX { grab } };
+        self.set_scroll_from_thumb(vertical, pos, grab);
     }
 
     // top-left corner of the canvas in viewport coordinates (logical pixels);
@@ -1474,6 +1547,16 @@ impl Application {
                     changed = true;
                 }
             }
+            Drag::ScrollbarX { grab } => {
+                let origin = self.viewport_origin.get();
+                self.set_scroll_from_thumb(false, f32::from(event.position.x - origin.x), grab);
+                changed = true;
+            }
+            Drag::ScrollbarY { grab } => {
+                let origin = self.viewport_origin.get();
+                self.set_scroll_from_thumb(true, f32::from(event.position.y - origin.y), grab);
+                changed = true;
+            }
         }
         if changed {
             cx.notify();
@@ -1500,7 +1583,10 @@ impl Application {
                 }
             }
             // the move is recorded as one step when the selection is flattened
-            Drag::SelectMove { .. } | Drag::None => {}
+            Drag::SelectMove { .. }
+            | Drag::ScrollbarX { .. }
+            | Drag::ScrollbarY { .. }
+            | Drag::None => {}
         }
 
         // the selection may have just been created, moved or cleared
@@ -1543,9 +1629,15 @@ impl Application {
             cx.notify();
             return;
         }
-        
-        self.scroll.0 -= f32::from(delta.x);
-        self.scroll.1 -= f32::from(delta.y);
+
+        // Shift + wheel: scroll horizontally (mice without a horizontal wheel)
+        let (dx, dy) = if event.modifiers.shift && delta.x == px(0.) {
+            (f32::from(delta.y), 0.)
+        } else {
+            (f32::from(delta.x), f32::from(delta.y))
+        };
+        self.scroll.0 -= dx;
+        self.scroll.1 -= dy;
         self.clamp_scroll();
         self.mark_dirty();
         cx.notify();
@@ -1695,10 +1787,10 @@ impl Application {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
 
         let open_button = Button::new("btn-open")
-            .ghost().small().icon(IconName::Folder).tooltip("Open (Ctrl+O)")
+            .ghost().small().icon(IconName::FolderOpen).tooltip("Open (Ctrl+O)")
             .on_click(cx.listener(|this, _, window, cx| this.open_png(window, cx)));
         let save_button = Button::new("btn-save")
-            .ghost().small().icon(IconName::HardDrive).tooltip("Save (Ctrl+S)")
+            .ghost().small().icon(IconName::Save).tooltip("Save (Ctrl+S)")
             .on_click(cx.listener(|this, _, _, cx| { this.save_png(cx); }));
         let undo_button = Button::new("btn-undo")
             .ghost().small().icon(IconName::Undo2).tooltip("Undo (Ctrl+Z)")
@@ -1910,6 +2002,10 @@ impl Render for Application {
             _ => CursorStyle::Crosshair,
         };
 
+        let (bar_x, bar_y) = self.scrollbar_layout();
+        let track_color = rgba(0x00000018);
+        let thumb_color = rgba(0x00000080);
+
         // viewport: shows the pre-rendered image; the handlers live here so a stroke
         // keeps following the mouse even when it leaves the canvas
         let viewport = div()
@@ -1942,7 +2038,68 @@ impl Render for Application {
                     .top_0()
                     .left_0()
                     .size_full(),
-            );
+            )
+            // horizontal scrollbar
+            .children(bar_x.map(|t| {
+                div()
+                    .absolute()
+                    .left_0()
+                    .bottom_0()
+                    .w(px(t.track))
+                    .h(px(SCROLLBAR_SIZE))
+                    .bg(track_color)
+                    .cursor(CursorStyle::Arrow)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                            // do not let the viewport start drawing
+                            cx.stop_propagation();
+                            let origin = this.viewport_origin.get();
+                            this.start_scrollbar_drag(false, f32::from(e.position.x - origin.x));
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(2.))
+                            .bottom(px(2.))
+                            .left(px(t.start))
+                            .w(px(t.len))
+                            .rounded_full()
+                            .bg(thumb_color),
+                    )
+            }))
+            // vertical scrollbar
+            .children(bar_y.map(|t| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h(px(t.track))
+                    .w(px(SCROLLBAR_SIZE))
+                    .bg(track_color)
+                    .cursor(CursorStyle::Arrow)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            let origin = this.viewport_origin.get();
+                            this.start_scrollbar_drag(true, f32::from(e.position.y - origin.y));
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(2.))
+                            .right(px(2.))
+                            .top(px(t.start))
+                            .h(px(t.len))
+                            .rounded_full()
+                            .bg(thumb_color),
+                    )
+            }));
 
         div()
             .size_full()
