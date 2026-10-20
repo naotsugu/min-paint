@@ -8,7 +8,7 @@ use gpui_kit::*;
 use gpui_kit::assets::{AllAssets, IconName};
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_kit::component::input::{InputState, NumberInput};
-use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::button::{Button, ButtonVariants as _, Toggle};
 use gpui_kit::component::{ActiveTheme, Icon, IndexPath, Sizable};
@@ -30,16 +30,10 @@ const PALETTE: [u32; 20] = [
     0xa349a4, 0xc8bfe7, // purple, lavender
 ];
 
-const BRUSH_SIZES: [&str; 16] = [
-    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "12", "16", "24", "32", "48", "64",
-];
-
-const DEFAULT_CANVAS_SIZE: (usize, usize) = (600, 500);
-
+// UI size
 const SIDEBAR_WIDTH: f32 = 72.;
 const SWATCH_SIZE: f32 = 16.;
 const FOOTER_HEIGHT: f32 = 32.;
-
 const SCROLLBAR_SIZE: f32 = 12.;
 const MIN_THUMB_LEN: f32 = 24.;
 
@@ -51,6 +45,7 @@ const MAX_ZOOM_PERCENT: f32 = 1600.;
 // the pixel grid is shown from this zoom factor (8.0 = 800%)
 const GRID_MIN_ZOOM: f32 = 8.;
 
+const DEFAULT_CANVAS_SIZE: (usize, usize) = (600, 500);
 const MAX_CANVAS_SIZE: usize = 4096;
 const MAX_HISTORY: usize = 100;
 
@@ -65,7 +60,7 @@ fn union_rect(a: Rect, b: Rect) -> Rect {
     (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
 }
 
-// center of a canvas pixel in continuous coordinates
+/// center of a canvas pixel in continuous coordinates
 fn pixel_center(p: (i32, i32)) -> (f32, f32) {
     (p.0 as f32 + 0.5, p.1 as f32 + 0.5)
 }
@@ -76,7 +71,6 @@ struct Coverage {
     height: usize,
     data: Vec<u8>,
 }
-
 impl Coverage {
     fn new(width: usize, height: usize) -> Self {
         Self { width, height, data: vec![0; width * height] }
@@ -280,8 +274,8 @@ impl Bitmap {
     fn ellipse(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, size: i32, filled: bool, color: [u8; 4]) {
         let cx = (x0 + x1) as f32 / 2.;
         let cy = (y0 + y1) as f32 / 2.;
-        let a = (x1 - x0) as f32 / 2.;
-        let b = (y1 - y0) as f32 / 2.;
+        let a  = (x1 - x0) as f32 / 2.;
+        let b  = (y1 - y0) as f32 / 2.;
 
         if filled {
             // one span per row
@@ -631,7 +625,7 @@ pub struct Application {
     zoom_percent: f32,
     // how far the viewport is scrolled into the content, in logical pixels (>= 0)
     scroll: (f32, f32),
-    size_select: Entity<SelectState<SearchableVec<&'static str>>>,
+    size_select: Entity<SelectState<Vec<&'static str>>>,
     width_input: Entity<InputState>,
     height_input: Entity<InputState>,
     color_picker: Entity<ColorPickerState>,
@@ -654,7 +648,7 @@ impl Application {
         // brush size select
         let size_select = cx.new(|cx| {
             SelectState::new(
-                SearchableVec::new(BRUSH_SIZES.to_vec()),
+                vec!["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "12", "16", "24", "32", "48", "64"],
                 Some(IndexPath::new(2)),
                 window,
                 cx,
@@ -954,7 +948,7 @@ impl Application {
         for y in 0..h {
             let cy = ys[y];
             // first device row of a canvas pixel row
-            let on_hline = grid && cy >= 0 && (y == 0 || ys[y - 1] != cy);
+            let on_h_line = grid && cy >= 0 && (y == 0 || ys[y - 1] != cy);
             let row = &mut buf[y * w * 4..(y + 1) * w * 4];
             for x in 0..w {
                 let cx = xs[x];
@@ -971,7 +965,7 @@ impl Application {
                     };
                     let mut c = [p[0], p[1], p[2]];
                     // first device column of a canvas pixel column
-                    if grid && (on_hline || x == 0 || xs[x - 1] != cx) {
+                    if grid && (on_h_line || x == 0 || xs[x - 1] != cx) {
                         for v in &mut c {
                             *v = ((*v as u16 + 0x80) / 2) as u8;
                         }
@@ -1225,7 +1219,7 @@ impl Application {
             self.sync_size_inputs(window, cx);
         }
 
-        // place it at the top-left corner of the visible area, kept inside the canvas
+        // place it in the top-left corner of the visible area, kept inside the canvas
         let (ox, oy) = self.canvas_origin();
         let zoom = self.zoom();
         let x = ((-ox / zoom).ceil() as i32).clamp(0, (self.bitmap.width - w) as i32);
@@ -1931,7 +1925,7 @@ impl Application {
                     .h(px(SWATCH_SIZE))
                     .bg(color)
                     .border_2()
-                    .border_color(if selected { rgb(0x0078d7) } else { rgb(0x808080) })
+                    .border_color(if selected { cx.theme().accent_foreground } else { cx.theme().border })
                     .cursor(CursorStyle::PointingHand)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2083,8 +2077,6 @@ impl Render for Application {
         };
 
         let (bar_x, bar_y) = self.scrollbar_layout();
-        let track_color = rgba(0x00000018);
-        let thumb_color = rgba(0x00000080);
 
         // viewport: shows the pre-rendered image; the handlers live here so a stroke
         // keeps following the mouse even when it leaves the canvas
@@ -2094,7 +2086,6 @@ impl Render for Application {
             .min_w_0()
             .h_full()
             .overflow_hidden()
-            .bg(rgb(0xc8c8c8))
             .cursor(pointer)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
@@ -2127,7 +2118,7 @@ impl Render for Application {
                     .bottom_0()
                     .w(px(t.track))
                     .h(px(SCROLLBAR_SIZE))
-                    .bg(track_color)
+                    .bg(cx.theme().scrollbar)
                     .cursor(CursorStyle::Arrow)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2147,7 +2138,7 @@ impl Render for Application {
                             .left(px(t.start))
                             .w(px(t.len))
                             .rounded_full()
-                            .bg(thumb_color),
+                            .bg(cx.theme().scrollbar_thumb),
                     )
             }))
             // vertical scrollbar
@@ -2158,7 +2149,7 @@ impl Render for Application {
                     .right_0()
                     .h(px(t.track))
                     .w(px(SCROLLBAR_SIZE))
-                    .bg(track_color)
+                    .bg(cx.theme().scrollbar)
                     .cursor(CursorStyle::Arrow)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2177,7 +2168,7 @@ impl Render for Application {
                             .top(px(t.start))
                             .h(px(t.len))
                             .rounded_full()
-                            .bg(thumb_color),
+                            .bg(cx.theme().scrollbar_thumb),
                     )
             }));
 
@@ -2232,8 +2223,6 @@ fn main() {
             }
         }).detach();
 
-        cx.activate(true);
-
     });
 }
 
@@ -2241,10 +2230,11 @@ fn window_options(cx: &mut App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
+        focus: true,
         titlebar: Some(TitlebarOptions {
             title: Some(SharedString::new("min-paint")),
             appears_transparent: false,
-            traffic_light_position: None
+            traffic_light_position: None,
         }),
         ..Default::default()
     }
