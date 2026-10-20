@@ -2032,8 +2032,13 @@ impl Application {
                     .tooltip(move |window, cx| Tooltip::new(full_path.clone()).build(window, cx)),
             )
             // zoom
-            .child(div().text_xs().child("Zoom"))
-            .child(Slider::new(&self.zoom_slider))
+            .child(div()
+                .w(px(140.))
+                .flex_none() // do not let the footer's flex layout resize it
+                .flex()
+                .flex_row()
+                .child(Slider::new(&self.zoom_slider)),
+            )
             .child(fit_button)
             .child(
                 div()
