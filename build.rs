@@ -21,8 +21,8 @@ fn embed_windows_resources() {
 
     // FileVersion / ProductVersion / ProductName / FileDescription are filled
     // automatically from Cargo.toml. Override only what you need.
-    res.set_icon("assets/windows/app.ico")
-        .set_manifest_file("assets/windows/app.manifest")
+    res.set_icon("assets/windows/min-paint.ico")
+        .set_manifest_file("assets/windows/min-paint.manifest")
         .set("CompanyName", "mammb.com.")
         .set("LegalCopyright", "Copyright (C) mammb.com. All rights reserved.")
         .set("OriginalFilename", "min-paint.exe");

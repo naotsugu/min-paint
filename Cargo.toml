@@ -31,7 +31,7 @@ opt-level = 3
 [package.metadata.bundle]
 name = "min-paint"
 identifier = "com.mammb.min-paint"
-icon = ["assets/macos/app.icns", "assets/linux/min-paint.png"]
+icon = ["assets/macos/min-paint.icns", "assets/linux/min-paint.png"]
 category = "Utility"
 short_description = "Minimal paint application"
 
