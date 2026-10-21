@@ -15,6 +15,7 @@ use gpui_kit::component::{ActiveTheme, Icon, IndexPath, Sizable};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::Theme;
 
 // palette (column-major pairs: top row, bottom row)
 const PALETTE: [u32; 20] = [
@@ -51,7 +52,7 @@ const MAX_HISTORY: usize = 100;
 
 const BACKGROUND: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
 // color of the area around the canvas
-const SURROUND: [u8; 3] = [0xc8, 0xc8, 0xc8];
+//const SURROUND: [u8; 3] = [0xc8, 0xc8, 0xc8];
 
 
 type Rect = (i32, i32, i32, i32); // x0, y0, x1, y1 (end-exclusive)
@@ -669,13 +670,13 @@ impl Application {
         // canvas size inputs (applied with the Resize button)
         let width_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .default_value("600")
+                .default_value(DEFAULT_CANVAS_SIZE.0.to_string())
                 .step(10.)
                 .min(1.)
         });
         let height_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .default_value("500")
+                .default_value(DEFAULT_CANVAS_SIZE.1.to_string())
                 .step(10.)
                 .min(1.)
         });
@@ -711,6 +712,12 @@ impl Application {
         });
 
         let bitmap = Bitmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
+
+        // follow the OS appearance (light / dark): apply it now and whenever it changes
+        Theme::sync_system_appearance(Some(window), cx);
+        let appearance_sub = window.observe_window_appearance(|window, cx| {
+            Theme::sync_system_appearance(Some(window), cx);
+        });
 
         // ask about unsaved changes when the window is about to close (X button, Alt+F4, ...);
         // returning false from the callback keeps the window open
@@ -752,7 +759,7 @@ impl Application {
             view_pixels: (0, 0),
             view_dirty: true,
             focus_handle: cx.focus_handle(),
-            _subscriptions: vec![color_sub, size_sub, zoom_sub],
+            _subscriptions: vec![color_sub, size_sub, zoom_sub, appearance_sub],
         }
     }
 
@@ -899,7 +906,7 @@ impl Application {
         cx.notify();
     }
 
-    // convert a window position into canvas pixel coordinates (may be outside the bitmap)
+    // convert a window position into canvas pixel coordinates (maybe outside the bitmap)
     fn to_canvas_px(&self, pos: Point<Pixels>) -> (i32, i32) {
         let origin = self.viewport_origin.get();
         let (ox, oy) = self.canvas_origin();
@@ -912,7 +919,7 @@ impl Application {
     // -- view rendering ------------------------------------------------------
 
     // build the visible part of the bitmap, magnified with nearest-neighbor sampling
-    fn rebuild_view_image(&mut self, window: &mut Window) {
+    fn rebuild_view_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let scale = window.scale_factor();
         let w = (f32::from(self.viewport_size.width) * scale).ceil().max(1.) as usize;
         let h = (f32::from(self.viewport_size.height) * scale).ceil().max(1.) as usize;
@@ -946,26 +953,26 @@ impl Application {
         let grid = self.zoom() >= GRID_MIN_ZOOM;
         let mut buf = vec![0u8; w * h * 4];
         for y in 0..h {
-            let cy = ys[y];
+            let cry = ys[y];
             // first device row of a canvas pixel row
-            let on_h_line = grid && cy >= 0 && (y == 0 || ys[y - 1] != cy);
+            let on_h_line = grid && cry >= 0 && (y == 0 || ys[y - 1] != cry);
             let row = &mut buf[y * w * 4..(y + 1) * w * 4];
             for x in 0..w {
-                let cx = xs[x];
-                let [r, g, b] = if cx < 0 || cy < 0 {
-                    SURROUND
+                let crx = xs[x];
+                let [r, g, b] = if crx < 0 || cry < 0 {
+                    to_rgb8(invert_lightness(cx.theme().muted_foreground))
                 } else {
                     let p = match floating {
                         Some((sx, sy, f))
-                        if cx >= sx && cx < sx + f.width as i32 && cy >= sy && cy < sy + f.height as i32 =>
+                        if crx >= sx && crx < sx + f.width as i32 && cry >= sy && cry < sy + f.height as i32 =>
                             {
-                                f.pixels[(cy - sy) as usize * f.width + (cx - sx) as usize]
+                                f.pixels[(cry - sy) as usize * f.width + (crx - sx) as usize]
                             }
-                        _ => self.bitmap.pixels[cy as usize * self.bitmap.width + cx as usize],
+                        _ => self.bitmap.pixels[cry as usize * self.bitmap.width + crx as usize],
                     };
                     let mut c = [p[0], p[1], p[2]];
                     // first device column of a canvas pixel column
-                    if grid && (on_h_line || x == 0 || xs[x - 1] != cx) {
+                    if grid && (on_h_line || x == 0 || xs[x - 1] != crx) {
                         for v in &mut c {
                             *v = ((*v as u16 + 0x80) / 2) as u8;
                         }
@@ -1834,7 +1841,7 @@ impl Application {
             .ghost().small().icon(IconName::Save).tooltip("Save (Ctrl+S)")
             .on_click(cx.listener(|this, _, _, cx| { this.save_png(false, cx); }));
         let save_as_button = Button::new("btn-save-as")
-            .ghost().small().icon(IconName::SaveCheck).tooltip("Save As (Ctrl+Shift+S)")
+            .ghost().small().icon(IconName::SavePen).tooltip("Save As (Ctrl+Shift+S)")
             .on_click(cx.listener(|this, _, _, cx| { this.save_png(true, cx); }));
         let undo_button = Button::new("btn-undo")
             .ghost().small().icon(IconName::Undo2).tooltip("Undo (Ctrl+Z)")
@@ -1996,7 +2003,7 @@ impl Application {
 
         let fit_button = Button::new("btn-fit")
             .xsmall()
-            .icon(IconName::Maximize)
+            .icon(IconName::ScanSquare)
             .tooltip("Fit to window")
             .on_click(cx.listener(|this, _, window, cx| this.fit_to_window(window, cx)));
 
@@ -2062,7 +2069,7 @@ impl Render for Application {
             (f32::from(self.viewport_size.height) * scale).ceil().max(1.) as usize,
         );
         if self.view_dirty || self.view_pixels != wanted || self.view_image.is_none() {
-            self.rebuild_view_image(window);
+            self.rebuild_view_image(window, cx);
         }
 
         let image = self.view_image.clone();
@@ -2192,12 +2199,25 @@ impl Render for Application {
     }
 }
 
-// convert a gpui color into an opaque RGBA pixel
+/// convert a gpui color into an opaque RGBA pixel
 fn to_rgba8(color: Hsla) -> [u8; 4] {
     let c: Rgba = color.into();
     let q = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
     [q(c.r), q(c.g), q(c.b), 0xff]
 }
+/// convert a gpui color into an opaque RGB pixel
+fn to_rgb8(color: Hsla) -> [u8; 3] {
+    let c: Rgba = color.into();
+    let q = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
+    [q(c.r), q(c.g), q(c.b)]
+}
+fn invert_lightness(color: Hsla) -> Hsla {
+    Hsla {
+        l: 1.0 - color.l,
+        ..color
+    }
+}
+
 
 fn show_error(message: &str) {
     // the release build has no console, so report errors with a dialog
