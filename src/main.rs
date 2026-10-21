@@ -1649,7 +1649,8 @@ impl Application {
             return;
         }
         let key = &event.keystroke;
-        if key.modifiers.platform {
+        let with_control = if cfg!(target_os = "macos") { key.modifiers.platform } else { key.modifiers.control };
+        if with_control {
             match key.key.as_str() {
                 "z" if key.modifiers.shift => self.redo(window, cx),
                 "z" => self.undo(window, cx),
