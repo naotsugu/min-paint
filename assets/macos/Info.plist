@@ -6,7 +6,7 @@
   <key>CFBundleDisplayName</key><string>min-paint</string>
   <key>CFBundleIdentifier</key><string>com.mammb.min-paint</string>
   <key>CFBundleExecutable</key><string>min-paint</string>
-  <key>CFBundleIconFile</key><string>app.icns</string>
+  <key>CFBundleIconFile</key><string>min-paint.icns</string>
   <key>CFBundleVersion</key><string>0.1.0</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
