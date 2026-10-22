@@ -2,6 +2,7 @@
 
 Minimal paint application.
 
+![screenshot1](docs/screenshot-01.png)
 
 ## How to build
 
