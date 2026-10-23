@@ -913,6 +913,13 @@ impl Application {
         cx.notify();
     }
 
+    fn fit_to_actual(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_zoom(100.);
+        self.zoom_slider
+            .update(cx, |state, cx| state.set_value(100., window, cx));
+        cx.notify();
+    }
+
     // convert a window position into canvas pixel coordinates (maybe outside the bitmap)
     fn to_canvas_px(&self, pos: Point<Pixels>) -> (i32, i32) {
         let origin = self.viewport_origin.get();
@@ -2026,12 +2033,17 @@ impl Application {
             .map(|s| format!("{} × {} px", s.w, s.h))
             .unwrap_or_default();
 
-
         let fit_button = Button::new("btn-fit")
             .xsmall()
             .icon(IconName::ScanSquare)
             .tooltip("Fit to window")
             .on_click(cx.listener(|this, _, window, cx| this.fit_to_window(window, cx)));
+
+        let fit_actual_button = Button::new("btn-fit-actual")
+            .xsmall()
+            .icon(IconName::Scan)
+            .tooltip("100%")
+            .on_click(cx.listener(|this, _, window, cx| this.fit_to_actual(window, cx)));
 
         div()
             .w_full()
@@ -2068,6 +2080,7 @@ impl Application {
                 .child(Slider::new(&self.zoom_slider)),
             )
             .child(fit_button)
+            .child(fit_actual_button)
             .child(
                 div()
                     .w(px(44.))
@@ -2254,7 +2267,7 @@ fn show_error(message: &str) {
         .show();
 }
 
-// override the accent color in dark mode, where the default is too close to the background
+/// override the accent color in dark mode, where the default is too close to the background
 fn update_theme_color(cx: &mut App) {
     if Theme::global(cx).mode.is_dark() {
         Theme::update(cx, |theme| {
