@@ -1250,15 +1250,34 @@ impl Application {
             self.sync_size_inputs(window, cx);
         }
 
-        // place it in the top-left corner of the visible area, kept inside the canvas
+        // the canvas may have just grown, so make sure the scroll position is valid first
+        self.clamp_scroll();
+
+        // part of the canvas that is actually visible, in whole canvas pixels;
+        // the scrollbars are drawn over the viewport, so the area under them does not count
+        let (bar_x, bar_y) = self.scrollbar_layout();
+        let view_w = f32::from(self.viewport_size.width) - if bar_y.is_some() { SCROLLBAR_SIZE } else { 0. };
+        let view_h = f32::from(self.viewport_size.height) - if bar_x.is_some() { SCROLLBAR_SIZE } else { 0. };
         let (ox, oy) = self.canvas_origin();
         let zoom = self.zoom();
-        let x = ((-ox / zoom).ceil() as i32).clamp(0, (self.bitmap.width - w) as i32);
-        let y = ((-oy / zoom).ceil() as i32).clamp(0, (self.bitmap.height - h) as i32);
+        let (bw, bh) = (self.bitmap.width as i32, self.bitmap.height as i32);
+        let vx0 = ((-ox / zoom).ceil() as i32).clamp(0, bw);
+        let vy0 = ((-oy / zoom).ceil() as i32).clamp(0, bh);
+        let vx1 = (((view_w - ox) / zoom).floor() as i32).clamp(vx0, bw);
+        let vy1 = (((view_h - oy) / zoom).floor() as i32).clamp(vy0, bh);
+
+        // Center the image in the visible range when it fits there, so it is fully visible.
+        // Otherwise, align it to the start of the visible range, so that it covers the view.
+        // The result is always clamped into the canvas, so the paste position never grows it.
+        let place = |lo: i32, hi: i32, len: i32, max: i32| -> i32 {
+            let pos = if len <= hi - lo { lo + (hi - lo - len) / 2 } else { lo };
+            pos.clamp(0, max.max(0))
+        };
+        let x = place(vx0, vx1, w as i32, bw - w as i32);
+        let y = place(vy0, vy1, h as i32, bh - h as i32);
 
         self.tool = Tool::Select;
         self.selection = Some(Selection { x, y, w: w as i32, h: h as i32, floating: Some(pasted) });
-        self.clamp_scroll();
         self.mark_dirty();
         cx.notify();
     }
