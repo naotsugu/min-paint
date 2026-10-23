@@ -905,8 +905,6 @@ impl Application {
         // round down to a whole percent so that the canvas is never cut off
         let percent = (zoom * 100.).floor().clamp(MIN_ZOOM_PERCENT, MAX_ZOOM_PERCENT);
         self.apply_zoom(percent);
-        self.scroll = (0., 0.);
-        self.clamp_scroll();
         // keep the slider thumb in sync
         self.zoom_slider
             .update(cx, |state, cx| state.set_value(percent, window, cx));
@@ -915,6 +913,7 @@ impl Application {
 
     fn fit_to_actual(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.apply_zoom(100.);
+        // keep the slider thumb in sync
         self.zoom_slider
             .update(cx, |state, cx| state.set_value(100., window, cx));
         cx.notify();
@@ -1677,10 +1676,11 @@ impl Application {
 
     fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
 
-        // text fields keep their own keyboard handling
-        let in_text_input = self.width_input.focus_handle(cx).is_focused(window)
-            || self.height_input.focus_handle(cx).is_focused(window);
-        if in_text_input {
+        // the control keep their own keyboard handling
+        if self.size_select.focus_handle(cx).is_focused(window)
+        || self.color_picker.focus_handle(cx).is_focused(window)
+        || self.width_input.focus_handle(cx).is_focused(window)
+        || self.height_input.focus_handle(cx).is_focused(window) {
             return;
         }
 
@@ -2256,7 +2256,6 @@ fn invert_lightness(color: Hsla) -> Hsla {
         ..color
     }
 }
-
 
 fn show_error(message: &str) {
     // the release build has no console, so report errors with a dialog
