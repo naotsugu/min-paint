@@ -726,7 +726,7 @@ impl Application {
             this.update(cx, |app, cx| app.confirm_discard(cx)).unwrap_or(true)
         });
 
-        Self {
+        let app = Self {
             committed: bitmap.clone(),
             bitmap,
             undo_stack: Vec::new(),
@@ -760,7 +760,10 @@ impl Application {
             view_dirty: true,
             focus_handle: cx.focus_handle(),
             _subscriptions: vec![color_sub, size_sub, zoom_sub, appearance_sub],
-        }
+        };
+        // give the canvas the keyboard focus at startup so that the shortcuts work at once
+        window.focus(&app.focus_handle, cx);
+        app
     }
 
     // zoom factor (1.0 = 100%)
@@ -1651,10 +1654,14 @@ impl Application {
     }
 
     fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // ignore keys typed into the input fields
-        if !self.focus_handle.is_focused(window) {
+
+        // text fields keep their own keyboard handling
+        let in_text_input = self.width_input.focus_handle(cx).is_focused(window)
+            || self.height_input.focus_handle(cx).is_focused(window);
+        if in_text_input {
             return;
         }
+
         let key = &event.keystroke;
         let with_control = if cfg!(target_os = "macos") { key.modifiers.platform } else { key.modifiers.control };
         if with_control {
@@ -1669,10 +1676,14 @@ impl Application {
                 "o" => self.open_png(window, cx),
                 _ => {}
             }
-        } else if key.key == "delete" {
-            self.delete_selection(cx);
-        } else if key.key == "escape" {
-             self.deselect(cx);
+        } else if self.focus_handle.is_focused(window) {
+            // plain keys only when the canvas itself has the focus, so that Esc / Delete
+            // inside popovers and dropdowns are left alone
+            match key.key.as_str() {
+                "delete" => self.delete_selection(cx),
+                "escape" => self.deselect(cx),
+                _ => {}
+            }
         }
     }
 
