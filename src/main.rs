@@ -11,7 +11,7 @@ use gpui_kit::component::input::{InputState, NumberInput};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::button::{Button, ButtonVariants as _, Toggle};
-use gpui_kit::component::{ActiveTheme, Icon, IndexPath, Sizable};
+use gpui_kit::component::{ActiveTheme, Colorize, Icon, IndexPath, Sizable};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::tooltip::Tooltip;
@@ -716,8 +716,11 @@ impl Application {
 
         // follow the OS appearance (light / dark): apply it now and whenever it changes
         Theme::sync_system_appearance(Some(window), cx);
+        update_theme_color(cx);
         let appearance_sub = window.observe_window_appearance(|window, cx| {
             Theme::sync_system_appearance(Some(window), cx);
+            update_theme_color(cx);
+            window.refresh();
         });
 
         // ask about unsaved changes when the window is about to close (X button, Alt+F4, ...);
@@ -2251,6 +2254,15 @@ fn show_error(message: &str) {
         .show();
 }
 
+// override the accent color in dark mode, where the default is too close to the background
+fn update_theme_color(cx: &mut App) {
+    if Theme::global(cx).mode.is_dark() {
+        Theme::update(cx, |theme| {
+            theme.accent = theme.blue.darken(0.5);
+        });
+    }
+}
+
 fn main() {
 
     application().with_assets(AllAssets).run(move |cx| {
@@ -2266,6 +2278,8 @@ fn main() {
                 cx.quit();
             }
         }).detach();
+
+        cx.activate(true);
 
     });
 }
