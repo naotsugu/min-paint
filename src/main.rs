@@ -16,6 +16,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::Theme;
+use image::RgbaImage;
 
 // palette (column-major pairs: top row, bottom row)
 const PALETTE: [u32; 20] = [
@@ -184,6 +185,18 @@ struct Bitmap {
 impl Bitmap {
     fn new(width: usize, height: usize, fill: [u8; 4]) -> Self {
         Self { width, height, pixels: vec![fill; width * height], dirty: None }
+    }
+    fn from(img: RgbaImage) -> Self {
+        let (width, height) = (img.width() as usize, img.height() as usize);
+        // the canvas is opaque, so flatten transparency onto white
+        let pixels = img.pixels()
+            .map(|p| {
+                let a = p[3] as u32;
+                let blend = |c: u8| ((c as u32 * a + 255 * (255 - a) + 127) / 255) as u8;
+                [blend(p[0]), blend(p[1]), blend(p[2]), 0xff]
+            })
+            .collect();
+        Self { width, height, pixels, dirty: None }
     }
 
     // grow the dirty area; the given rectangle must already be clipped to the bitmap
@@ -1225,17 +1238,7 @@ impl Application {
             show_error(&format!("The clipboard image must be at most {MAX_CANVAS_SIZE} px on each side."));
             return;
         }
-
-        // the canvas is opaque, so flatten transparency onto white
-        let pixels = decoded
-            .pixels()
-            .map(|p| {
-                let a = p[3] as u32;
-                let blend = |c: u8| ((c as u32 * a + 255 * (255 - a) + 127) / 255) as u8;
-                [blend(p[0]), blend(p[1]), blend(p[2]), 0xff]
-            })
-            .collect();
-        let pasted = Bitmap { width: w, height: h, pixels, dirty: None };
+        let pasted = Bitmap::from(decoded);
 
         // flatten the previous selection first
         self.commit_selection();
@@ -1858,19 +1861,8 @@ impl Application {
             }
         };
 
-        let (width, height) = img.dimensions();
-        // the canvas is opaque, so flatten transparency onto white
-        let pixels = img
-            .pixels()
-            .map(|p| {
-                let a = p[3] as u32;
-                let blend = |c: u8| ((c as u32 * a + 255 * (255 - a) + 127) / 255) as u8;
-                [blend(p[0]), blend(p[1]), blend(p[2]), 0xff]
-            })
-            .collect();
-
         // opening a file starts a new document: the history is cleared
-        let bitmap = Bitmap { width: width as usize, height: height as usize, pixels, dirty: None };
+        let bitmap = Bitmap::from(img);
         self.replace_bitmap(bitmap, false);
         self.file_path = Some(path.to_path_buf());
         self.scroll = (0., 0.);
