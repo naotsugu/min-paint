@@ -602,8 +602,9 @@ pub struct Application {
     committed: Bitmap,
     undo_stack: Vec<Edit>,
     redo_stack: Vec<Edit>,
-    // true when the document has changes that were not saved yet
-    modified: bool,
+    // undo depth of the saved (or freshly opened) document state;
+    // None when that state can no longer be reached with undo / redo
+    saved_depth: Option<usize>,
     // file the document was opened from or last saved to (None = Untitled)
     file_path: Option<PathBuf>,
     tool: Tool,
@@ -731,7 +732,7 @@ impl Application {
             bitmap,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            modified: false,
+            saved_depth: Some(0),
             file_path: None,
             tool: Tool::Pencil,
             drag: Drag::None,
@@ -1030,12 +1031,24 @@ impl Application {
 
     // -- history -------------------------------------------------------------
 
+    /// true when the document differs from the saved state
+    fn is_modified(&self) -> bool {
+        // pixels that were lifted by a selection move are not in the history yet
+        let lifted = self.selection.as_ref().is_some_and(|s| s.floating.is_some());
+        lifted || self.saved_depth != Some(self.undo_stack.len())
+    }
+
     fn push_edit(&mut self, edit: Edit) {
+        // a new edit discards the redo branch; if the saved state was inside it, it is lost
+        if self.saved_depth.is_some_and(|d| d > self.undo_stack.len()) {
+            self.saved_depth = None;
+        }
         self.undo_stack.push(edit);
         self.redo_stack.clear();
-        self.modified = true;
         if self.undo_stack.len() > MAX_HISTORY {
             self.undo_stack.remove(0);
+            // every depth moves down by one; the saved state is lost if it was the oldest one
+            self.saved_depth = self.saved_depth.and_then(|d| d.checked_sub(1));
         }
     }
 
@@ -1066,7 +1079,6 @@ impl Application {
             }
         }
         self.bitmap.dirty = None;
-        self.modified = true;
     }
 
     fn after_history_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1107,7 +1119,7 @@ impl Application {
             self.committed = new_bitmap.clone();
             self.undo_stack.clear();
             self.redo_stack.clear();
-            self.modified = false;
+            self.saved_depth = Some(0);
         }
         self.bitmap = new_bitmap;
     }
@@ -1735,7 +1747,7 @@ impl Application {
             return false;
         }
         self.file_path = Some(path);
-        self.modified = false;
+        self.saved_depth = Some(self.undo_stack.len());
         self.mark_dirty();
         cx.notify();
         true
@@ -1757,7 +1769,7 @@ impl Application {
         // flatten a floating selection first, so that it counts as a change
         self.commit_selection();
         self.drag = Drag::None;
-        if !self.modified {
+        if !self.is_modified() {
             return true;
         }
         let answer = rfd::MessageDialog::new()
@@ -1996,7 +2008,7 @@ impl Application {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Untitled".to_string());
-        let file_text = if self.modified { format!("*{base_name}") } else { base_name };
+        let file_text = if self.is_modified() { format!("*{base_name}") } else { base_name };
 
         let size_text = format!("{} × {} px", self.bitmap.width, self.bitmap.height);
         let cursor_text = self
