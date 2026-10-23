@@ -1368,14 +1368,19 @@ impl Application {
     // -- canvas size ---------------------------------------------------------
 
     fn sync_size_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let width = self.bitmap.width.to_string();
-        let height = self.bitmap.height.to_string();
-        self.width_input.update(cx, |state, cx| state.set_value(width, window, cx));
-        self.height_input.update(cx, |state, cx| state.set_value(height, window, cx));
+        let (width, height) = (self.bitmap.width, self.bitmap.height);
+        self.set_size_inputs(width, height, window, cx);
+    }
+
+    // show the given size in the width / height inputs
+    fn set_size_inputs(&mut self, width: usize, height: usize, window: &mut Window, cx: &mut Context<Self>) {
+            let width = width.to_string();
+            let height = height.to_string();
+            self.width_input.update(cx, |state, cx| state.set_value(width, window, cx));
+            self.height_input.update(cx, |state, cx| state.set_value(height, window, cx));
     }
 
     fn apply_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.commit_selection();
 
         let width = self.width_input.read(cx).value().parse::<usize>().ok();
         let height = self.height_input.read(cx).value().parse::<usize>().ok();
@@ -1387,16 +1392,19 @@ impl Application {
             show_error(&format!("The size must be between 1 and {MAX_CANVAS_SIZE}."));
             return false;
         }
-        if width == self.bitmap.width && height == self.bitmap.height {
+        // the trim origin is the top-left corner of the selection (the canvas origin if nothing is selected);
+        // it is read before the selection is flattened, and only after validation succeeded,
+        // so that a rejected input leaves the selection intact for the next try
+        let (ox, oy) = self.selection.as_ref().map_or((0, 0), |s| (s.x, s.y));
+        if (ox, oy) == (0, 0) && width == self.bitmap.width && height == self.bitmap.height {
             return false;
         }
 
-        // keep the overlapping part anchored at the top-left, fill the rest with the background
-        let mut new_bitmap = Bitmap::new(width, height, BACKGROUND);
-        let copy_w = width.min(self.bitmap.width);
-        let copy_h = height.min(self.bitmap.height);
-        let data = self.bitmap.read_region(0, 0, copy_w, copy_h);
-        new_bitmap.write_region(0, 0, copy_w, copy_h, &data);
+        // flatten a floating selection so that its pixels are part of the trimmed image
+        self.commit_selection();
+
+        // trim at (ox, oy); the part outside of the current canvas becomes the background
+        let new_bitmap = self.bitmap.copy_region(ox, oy, width as i32, height as i32);
 
         self.replace_bitmap(new_bitmap, true);
         self.after_history_change(window, cx);
@@ -1404,8 +1412,12 @@ impl Application {
     }
 
     fn open_resize_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // show the current size in the inputs
-        self.sync_size_inputs(window, cx);
+        // show the selection size in the inputs, or the canvas size when nothing is selected
+        let trim = self.selection.is_some();
+        match self.selection.as_ref().map(|s| (s.w as usize, s.h as usize)) {
+            Some((w, h)) => self.set_size_inputs(w, h, window, cx),
+            None => self.sync_size_inputs(window, cx),
+        }
 
         // the dialog builder may run again, so it only captures cheap handles
         let app = cx.entity();
@@ -1431,7 +1443,7 @@ impl Application {
 
             let app = app.clone();
             dialog
-                .title("Resize canvas")
+                .title(if trim { "Trim to selection" } else { "Resize canvas" })
                 .w(px(320.))
                 .child(
                     div()
@@ -1440,9 +1452,14 @@ impl Application {
                         .gap(px(8.))
                         .child(row("Width", &width_input))
                         .child(row("Height", &height_input))
-                        .child(div().text_xs().child(format!(
-                            "1 to {MAX_CANVAS_SIZE} px. The image stays anchored at the top-left."
-                        ))),
+                        .child(div().text_xs().child(if trim {
+                            format!(
+                                "1 to {MAX_CANVAS_SIZE} px. The image is trimmed from the top-left of the selection; \
+                                 areas outside the image are filled with the background color."
+                            )
+                        } else {
+                            format!("1 to {MAX_CANVAS_SIZE} px. The image stays anchored at the top-left.")
+                        })),
                 )
                 .footer(
                     DialogFooter::new()
