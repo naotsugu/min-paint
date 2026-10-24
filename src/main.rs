@@ -16,7 +16,6 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::Theme;
-use image::RgbaImage;
 
 // palette (column-major pairs: top row, bottom row)
 const PALETTE: [u32; 20] = [
@@ -52,9 +51,6 @@ const MAX_CANVAS_SIZE: usize = 4096;
 const MAX_HISTORY: usize = 100;
 
 const BACKGROUND: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
-// color of the area around the canvas
-//const SURROUND: [u8; 3] = [0xc8, 0xc8, 0xc8];
-
 
 type Rect = (i32, i32, i32, i32); // x0, y0, x1, y1 (end-exclusive)
 
@@ -186,7 +182,7 @@ impl Bitmap {
     fn new(width: usize, height: usize, fill: [u8; 4]) -> Self {
         Self { width, height, pixels: vec![fill; width * height], dirty: None }
     }
-    fn from(img: RgbaImage) -> Self {
+    fn from(img: image::RgbaImage) -> Self {
         let (width, height) = (img.width() as usize, img.height() as usize);
         // the canvas is opaque, so flatten transparency onto white
         let pixels = img.pixels()
@@ -574,6 +570,7 @@ enum Tool {
     Line,
     Rectangle,
     Oval,
+    Text,
     Select,
 }
 
@@ -654,7 +651,8 @@ pub struct Application {
     view_pixels: (usize, usize),
     view_dirty: bool,
     focus_handle: FocusHandle,
-    _subscriptions: Vec<Subscription>, // keep subscriptions alive for the lifetime of the view
+    // keep subscriptions alive for the lifetime of the view
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Application {
@@ -1377,6 +1375,10 @@ impl Application {
         self.shape_bounds = Some((x0 - size, y0 - size, x1 + size + 1, y1 + size + 1));
     }
 
+    fn draw_text(&mut self, origin: (i32, i32), window: &mut Window, cx: &mut Context<Self>) {
+        // TODO
+    }
+
     // add a round-capped segment to the stroke's coverage and composite it over the saved pixels
     fn aa_segment(&mut self, from: (i32, i32), to: (i32, i32), color: [u8; 4]) {
         let (Some(backup), Some(cov)) = (self.shape_backup.as_ref(), self.coverage.as_mut()) else {
@@ -1557,6 +1559,11 @@ impl Application {
                     .then(|| Coverage::new(self.bitmap.width, self.bitmap.height));
                 self.shape_bounds = None;
                 self.draw_shape(p, p);
+            }
+            Tool::Text => {
+                if self.bitmap.get(p.0, p.1).is_some() {
+                    self.draw_text(p, window, cx);
+                }
             }
             Tool::Select => self.select_mouse_down(p),
         }
@@ -1938,6 +1945,7 @@ impl Application {
             .child(self.tool_button("Line", IconName::Slash, Tool::Line, cx))
             .child(self.tool_button("Rect", IconName::Square, Tool::Rectangle, cx))
             .child(self.tool_button("Oval", IconName::Ellipse, Tool::Oval, cx))
+            .child(self.tool_button("Text", IconName::Type, Tool::Text, cx))
             .child(self.tool_button("Select", IconName::SquareDashedMousePointer, Tool::Select, cx))
             .child(Button::new("btn-resize")
                 .small().icon(IconName::ImageUpscale).tooltip("Resize…").ghost()
@@ -2307,7 +2315,7 @@ fn main() {
 
     application().with_assets(AllAssets).run(move |cx| {
 
-        gpui_kit::init(cx);
+        init(cx);
 
         let window_options = window_options(cx);
         open_window(window_options, cx, |window, cx| cx.new(|cx| Application::new(window, cx)))

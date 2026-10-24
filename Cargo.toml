@@ -10,7 +10,7 @@ repository = "https://github.com/naotsugu/min-paint"
 license = "Apache-2.0"
 
 [dependencies]
-gpui-kit = "0.7.3"
+gpui-kit = "0.8.0"
 image = { version = "0.25.10", default-features = false,
     features = ["png", "bmp", "gif", "ico", "jpeg", "webp"] }
 rfd = "0.17.2"
