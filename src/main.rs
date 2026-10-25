@@ -7,7 +7,7 @@ use std::sync::Arc;
 use gpui_kit::*;
 use gpui_kit::assets::{AllAssets, IconName};
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
-use gpui_kit::component::input::{InputState, NumberInput};
+use gpui_kit::component::input::{Input, InputState, NumberInput};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::button::{Button, ButtonVariants as _, Toggle};
@@ -651,6 +651,9 @@ pub struct Application {
     view_pixels: (usize, usize),
     view_dirty: bool,
     focus_handle: FocusHandle,
+    // font
+    font_system: Option<cosmic_text::FontSystem>,
+    swash_cache: Option<cosmic_text::SwashCache>,
     // keep subscriptions alive for the lifetime of the view
     _subscriptions: Vec<Subscription>,
 }
@@ -774,6 +777,8 @@ impl Application {
             view_pixels: (0, 0),
             view_dirty: true,
             focus_handle: cx.focus_handle(),
+            font_system: None,
+            swash_cache: None,
             _subscriptions: vec![color_sub, size_sub, zoom_sub, appearance_sub],
         };
         // give the canvas the keyboard focus at startup so that the shortcuts work at once
@@ -1376,7 +1381,152 @@ impl Application {
     }
 
     fn draw_text(&mut self, origin: (i32, i32), window: &mut Window, cx: &mut Context<Self>) {
-        // TODO
+        let app = cx.entity();
+        let default_font_size = (self.brush_size * 8).clamp(12, 120);
+        let text_input = cx.new(|cx| InputState::new(window, cx).placeholder("Enter text..."));
+        let font_size_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(default_font_size.to_string())
+                .step(2.)
+                .min(6.)
+                .max(500.)
+        });
+        let initial_focus = Cell::new(true);
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if initial_focus.replace(false) {
+                text_input.focus_handle(cx).focus(window, cx);
+            }
+
+            let app = app.clone();
+            let text_input_clone = text_input.clone();
+            let font_size_input_clone = font_size_input.clone();
+
+            let row = |label: &'static str, input: &Entity<InputState>| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().w(px(56.)).text_sm().child(label))
+                    .child(div().flex_1().child(NumberInput::new(input)))
+            };
+
+            dialog
+                .title("Draw text")
+                .w(px(320.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(div().w(px(56.)).text_sm().child("Text"))
+                                .child(div().flex_1().child(Input::new(&text_input))),
+                        )
+                        .child(row("Size", &font_size_input))
+                        .child(div().text_xs().child("Text will be drawn at the clicked position.")),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("text-ok")
+                                .primary()
+                                .label("OK")
+                                .on_click(move |_, window, cx| {
+                                    let text = text_input_clone.read(cx).value().to_string();
+                                    // reject invalid sizes instead of silently falling back to a default
+                                    let Ok(font_size) = font_size_input_clone.read(cx).value().parse::<f32>() else {
+                                        show_error("Enter the font size as a number.");
+                                        return;
+                                    };
+                                    let font_size = font_size.clamp(6.0, 500.0);
+                                    if !text.is_empty() {
+                                        app.update(cx, |this, cx| {
+                                            this.render_text(&text, font_size, origin, cx);
+                                        });
+                                    }
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("text-cancel")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| {
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn render_text(&mut self, text: &str, font_size: f32, origin: (i32, i32), cx: &mut Context<Self>) {
+        let font_system = self.font_system.get_or_insert_with(cosmic_text::FontSystem::new);
+        let swash_cache = self.swash_cache.get_or_insert_with(cosmic_text::SwashCache::new);
+
+        let metrics = cosmic_text::Metrics::new(font_size, font_size * 1.25);
+        let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
+        let mut buffer = buffer.borrow_with(font_system);
+        let attrs = cosmic_text::Attrs::new();
+        buffer.set_text(text, &attrs, cosmic_text::Shaping::Advanced, None);
+        buffer.shape_until_scroll(false);
+
+        let color = to_rgba8(self.current_color);
+        let cosmic_color = cosmic_text::Color::rgba(color[0], color[1], color[2], 0xff);
+
+        let antialias = self.antialias;
+        let bw = self.bitmap.width as i32;
+        let bh = self.bitmap.height as i32;
+
+        let mut drawn = false;
+        buffer.draw(swash_cache, cosmic_color, |x, y, _w, _h, pixel_color| {
+            let px = origin.0 + x;
+            let py = origin.1 + y;
+            if px < 0 || py < 0 || px >= bw || py >= bh {
+                return;
+            }
+            let a = pixel_color.a();
+            if a == 0 {
+                return;
+            }
+            let glyph_rgb = [pixel_color.r(), pixel_color.g(), pixel_color.b()];
+            if !antialias {
+                if a >= 128 {
+                    self.bitmap.set(px, py, [glyph_rgb[0], glyph_rgb[1], glyph_rgb[2], 0xff]);
+                    drawn = true;
+                }
+            } else if a == 255 {
+                self.bitmap.set(px, py, [glyph_rgb[0], glyph_rgb[1], glyph_rgb[2], 0xff]);
+                drawn = true;
+            } else if let Some(bg) = self.bitmap.get(px, py) {
+                let alpha = a as u32;
+                let blend = |fg: u8, bg: u8| -> u8 {
+                    ((fg as u32 * alpha + bg as u32 * (255 - alpha) + 127) / 255) as u8
+                };
+                self.bitmap.set(
+                    px,
+                    py,
+                    [
+                        blend(glyph_rgb[0], bg[0]),
+                        blend(glyph_rgb[1], bg[1]),
+                        blend(glyph_rgb[2], bg[2]),
+                        0xff,
+                    ],
+                );
+                drawn = true;
+            }
+        });
+
+        if drawn {
+            self.record_history();
+            self.mark_dirty();
+            cx.notify();
+        }
     }
 
     // add a round-capped segment to the stroke's coverage and composite it over the saved pixels
@@ -2156,7 +2306,7 @@ impl Render for Application {
         let pointer = match self.drag {
             Drag::SelectMove { .. } => CursorStyle::ClosedHand,
             Drag::None if self.over_selection && self.selection.is_some() => CursorStyle::OpenHand,
-            _ => CursorStyle::Crosshair,
+            _ => if self.tool == Tool::Text { CursorStyle::IBeam } else { CursorStyle::Crosshair },
         };
 
         let (bar_x, bar_y) = self.scrollbar_layout();
