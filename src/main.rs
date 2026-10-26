@@ -659,7 +659,7 @@ pub struct Application {
 }
 
 impl Application {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(initial_file: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
 
         // brush size select
         let size_select = cx.new(|cx| {
@@ -744,7 +744,7 @@ impl Application {
             this.update(cx, |app, cx| app.confirm_discard(cx)).unwrap_or(true)
         });
 
-        let app = Self {
+        let mut app = Self {
             committed: bitmap.clone(),
             bitmap,
             undo_stack: Vec::new(),
@@ -756,7 +756,7 @@ impl Application {
             last_pos: (0, 0),
             brush_size: 3,
             shape_filled: false,
-            antialias: false,
+            antialias: true,
             coverage: None,
             shape_backup: None,
             shape_bounds: None,
@@ -783,6 +783,11 @@ impl Application {
         };
         // give the canvas the keyboard focus at startup so that the shortcuts work at once
         window.focus(&app.focus_handle, cx);
+        // open the file given on the command line (a fresh document has no changes,
+        // so no confirmation dialog appears)
+        if let Some(path) = initial_file {
+            app.load_image(&path, window, cx);
+        }
         app
     }
 
@@ -2510,13 +2515,18 @@ fn update_theme_color(cx: &mut App) {
 
 fn main() {
 
+    // the first command line argument is the image file to open
+    let initial_file: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
+
     application().with_assets(AllAssets).run(move |cx| {
 
         init(cx);
 
         let window_options = window_options(cx);
-        open_window(window_options, cx, |window, cx| cx.new(|cx| Application::new(window, cx)))
-            .expect("failed to open window");
+        open_window(window_options, cx, move |window, cx| {
+            cx.new(|cx| Application::new(initial_file.clone(), window, cx))
+        })
+        .expect("failed to open window");
 
         cx.on_window_closed(|cx, _window_id| {
             if cx.windows().is_empty() {
