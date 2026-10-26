@@ -1907,48 +1907,84 @@ impl Application {
 
     // -- files ---------------------------------------------------------------
 
-    // returns true when the image was saved;
-    // `save_as` forces the file dialog even if the document already has a path
+    // returns true when the image was saved right now;
+    // when a file dialog is needed, the save finishes asynchronously and this returns false
     fn save_png(&mut self, save_as: bool, cx: &mut Context<Self>) -> bool {
         // make sure a moved selection is part of the saved image
         self.commit_selection();
         self.drag = Drag::None;
 
-        // overwrite the current file directly, but only when it is a PNG
-        let existing = self.file_path.clone().filter(|p| {
-            !save_as && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))
-        });
-        let path = match existing {
-            Some(path) => path,
-            None => {
-                let mut dialog = rfd::FileDialog::new().add_filter("PNG image", &["png"]);
-                // start from the current file's folder and name (with a .png extension)
-                dialog = match &self.file_path {
-                    Some(p) => {
-                        let name = p
-                            .file_stem()
-                            .map(|s| format!("{}.png", s.to_string_lossy()))
-                            .unwrap_or_else(|| "drawing.png".to_string());
-                        if let Some(dir) = p.parent() {
-                            dialog = dialog.set_directory(dir);
-                        }
-                        dialog.set_file_name(name)
-                    }
-                    None => dialog.set_file_name("drawing.png"),
-                };
-                let Some(path) = dialog.save_file() else {
-                    return false; // canceled
-                };
-                if path.extension().is_none() { path.with_extension("png") } else { path }
+        // overwrite the current file directly, but only when its format can be written
+        let existing = self.file_path.clone().filter(|p| !save_as && save_format(p).is_some());
+        if let Some(path) = existing {
+            return self.write_image(path, cx);
+        }
+
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .add_filter("PNG image", &["png"])
+            .add_filter("JPEG image", &["jpg", "jpeg"])
+            .add_filter("BMP image", &["bmp"])
+            .add_filter("GIF image", &["gif"])
+            .add_filter("TIFF image", &["tif", "tiff"])
+            .add_filter("WebP image", &["webp"]);
+        // start from the current file's folder and name
+        dialog = match &self.file_path {
+            Some(p) => {
+                // keep the current extension if it can be saved, otherwise fall back to .png
+                let ext = if save_format(p).is_some() {
+                    p.extension().map(|e| e.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+                    .unwrap_or_else(|| "png".to_string());
+                let name = p
+                    .file_stem()
+                    .map(|s| format!("{}.{ext}", s.to_string_lossy()))
+                    .unwrap_or_else(|| "drawing.png".to_string());
+                if let Some(dir) = p.parent() {
+                    dialog = dialog.set_directory(dir);
+                }
+                dialog.set_file_name(name)
             }
+            None => dialog.set_file_name("drawing.png"),
         };
 
-        let data: Vec<u8> = self.bitmap.pixels.iter().flatten().copied().collect();
-        let Some(img) = image::RgbaImage::from_raw(self.bitmap.width as u32, self.bitmap.height as u32, data) else {
+        // Do not block inside the event handler: a modal dialog runs a nested run loop,
+        // and gpui callbacks fired meanwhile would hit the already borrowed App (RefCell panic).
+        cx.spawn(async move |this, cx| {
+            let Some(handle) = dialog.save_file().await else {
+                return; // canceled
+            };
+            let path = handle.path().to_path_buf();
+            // no extension: default to PNG
+            let path = if path.extension().is_none() { path.with_extension("png") } else { path };
+            this.update(cx, |this, cx| {
+                this.write_image(path, cx);
+            })
+                .ok();
+        })
+            .detach();
+        false
+    }
+
+    // encode the bitmap in the format given by the extension of `path` and write it
+    fn write_image(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
+        // the dialog was open for a while, so flatten any selection created in the meantime
+        self.commit_selection();
+
+        // the format follows the extension the user chose
+        let Some(format) = save_format(&path) else {
+            show_error("Unsupported file extension. Use png, jpg, bmp, gif, tif or webp.");
+            return false;
+        };
+
+        // the canvas is opaque, so save as RGB (JPEG and others cannot store an alpha channel)
+        let data: Vec<u8> = self.bitmap.pixels.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let Some(img) = image::RgbImage::from_raw(self.bitmap.width as u32, self.bitmap.height as u32, data) else {
             show_error("Failed to build the image.");
             return false;
         };
-        if let Err(e) = img.save_with_format(&path, image::ImageFormat::Png) {
+        if let Err(e) = image::DynamicImage::ImageRgb8(img).save_with_format(&path, format) {
             show_error(&format!("Failed to save the image: {e}"));
             return false;
         }
@@ -1959,14 +1995,20 @@ impl Application {
         true
     }
 
-    fn open_png(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("PNG image", &["png"])
-            .pick_file()
-        else {
-            return; // canceled
-        };
-        self.load_image(&path, window, cx);
+    fn open_png(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let dialog = rfd::AsyncFileDialog::new()
+            .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp"]);
+        cx.spawn(async move |this, cx| {
+            let Some(handle) = dialog.pick_file().await else {
+                return; // canceled
+            };
+            let path = handle.path().to_path_buf();
+            this.update_in(cx, |this, window, cx| {
+                this.load_image(&path, window, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // Ask what to do with unsaved changes before the document is replaced.
@@ -2441,6 +2483,11 @@ fn invert_lightness(color: Hsla) -> Hsla {
         l: 1.0 - color.l,
         ..color
     }
+}
+
+/// the image format of a path, if it can be written with the `image` crate
+fn save_format(path: &Path) -> Option<image::ImageFormat> {
+    image::ImageFormat::from_path(path).ok().filter(|f| f.can_write())
 }
 
 fn show_error(message: &str) {
