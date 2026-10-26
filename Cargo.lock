@@ -3694,7 +3694,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "min_paint"
+name = "min-paint"
 version = "0.1.0"
 dependencies = [
  "cosmic-text",

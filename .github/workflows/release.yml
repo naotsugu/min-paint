@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux-x64
+            os: ubuntu-22.04
+            targets: x86_64-unknown-linux-gnu
+            archive_name: min-paint-${{ github.ref_name }}-linux-x64.zip
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            targets: aarch64-unknown-linux-gnu
+            archive_name: min-paint-${{ github.ref_name }}-linux-arm64.zip
+          - name: macos
+            os: macos-latest
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+            archive_name: min-paint-${{ github.ref_name }}-macos-universal.zip
+          - name: windows-x64
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
+            archive_name: min-paint-${{ github.ref_name }}-windows-x64.zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.targets }}
+
+      # --- Linux: Install dependencies & build ---
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libvulkan-dev \
+            pkg-config \
+            zip
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --target ${{ matrix.platform.targets }}
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.platform.targets }}/release/min-paint staging/
+          chmod +x staging/min-paint
+          cp assets/linux/min-paint.desktop staging/
+          cp assets/linux/min-paint.png staging/
+          cp README.md LICENSE staging/
+          cd staging
+          zip -r ../${{ matrix.platform.archive_name }} ./*
+
+      # --- macOS: Setup bundle & build Universal binary ---
+      - name: Install cargo-bundle (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo install cargo-bundle --locked
+
+      - name: Build Universal Bundle (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo bundle --release --format osx --target aarch64-apple-darwin --target x86_64-apple-darwin
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          APP_PATH=$(find target -name "min-paint.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: min-paint.app not found!"
+            exit 1
+          fi
+          echo "Found application bundle at: $APP_PATH"
+          lipo -info "$APP_PATH/Contents/MacOS/min-paint"
+          ditto -c -k --keepParent "$APP_PATH" "${{ matrix.platform.archive_name }}"
+
+      # --- Windows: Build & Package ---
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --release --target ${{ matrix.platform.targets }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging
+          Copy-Item target/${{ matrix.platform.targets }}/release/min-paint.exe staging/
+          Copy-Item README.md staging/
+          Copy-Item LICENSE staging/
+          Compress-Archive -Path staging/* -DestinationPath ${{ matrix.platform.archive_name }}
+
+      # --- Upload build artifact ---
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform.name }}
+          path: ${{ matrix.platform.archive_name }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        working-directory: artifacts
+        run: |
+          sha256sum *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "min-paint ${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/*.zip \
+            artifacts/SHA256SUMS.txt
