@@ -68,10 +68,40 @@ struct Coverage {
     width: usize,
     height: usize,
     data: Vec<u8>,
+    dirty: Option<Rect>,
 }
 impl Coverage {
     fn new(width: usize, height: usize) -> Self {
-        Self { width, height, data: vec![0; width * height] }
+        Self { width, height, data: vec![0; width * height], dirty: None }
+    }
+
+    /// Resize if necessary, and clear only the modified region from the previous stroke.
+    fn prepare(&mut self, width: usize, height: usize) {
+        if self.width != width || self.height != height || self.data.len() != width * height {
+            self.width = width;
+            self.height = height;
+            self.data.resize(width * height, 0);
+            self.data.fill(0);
+            self.dirty = None;
+        } else if let Some(rect) = self.dirty.take() {
+            self.clear_rect(rect);
+        }
+    }
+
+    fn clear_all(&mut self) {
+        if let Some(rect) = self.dirty.take() {
+            self.clear_rect(rect);
+        }
+    }
+
+    fn mark_dirty(&mut self, rect: Rect) {
+        if rect.0 >= rect.2 || rect.1 >= rect.3 {
+            return;
+        }
+        self.dirty = Some(match self.dirty {
+            Some(d) => union_rect(d, rect),
+            None => rect,
+        });
     }
 
     // clip a floating-point bounding box to the mask
@@ -99,6 +129,9 @@ impl Coverage {
 
     // keep the larger coverage when shapes overlap, so overlaps never get darker
     fn put(&mut self, x: i32, y: i32, value: f32) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
         let v = (value.clamp(0., 1.) * 255.).round() as u8;
         let i = y as usize * self.width + x as usize;
         if v > self.data[i] {
@@ -130,6 +163,7 @@ impl Coverage {
                 self.put(x, y, radius + 0.5 - d);
             }
         }
+        self.mark_dirty(rect);
         rect
     }
 
@@ -145,7 +179,9 @@ impl Coverage {
             rect = Some(rect.map_or(r, |u| union_rect(u, r)));
             prev = p;
         }
-        rect.unwrap_or((0, 0, 0, 0))
+        let rect = rect.unwrap_or((0, 0, 0, 0));
+        self.mark_dirty(rect);
+        rect
     }
 
     /// Filled ellipse; the edge coverage comes from an approximate distance to the boundary.
@@ -163,6 +199,7 @@ impl Coverage {
                 self.put(x, y, 0.5 - d);
             }
         }
+        self.mark_dirty(rect);
         rect
     }
 }
@@ -323,14 +360,14 @@ impl Bitmap {
         }
 
         let w = self.width;
-        // `filled` marks the region; its pixels are painted after the search finishes,
-        // so all reads below still see the original colors
-        let mut filled = vec![false; w * self.height];
+        let height = self.height as i32;
+        // 0 = unvisited, 1 = filled region, 2 = edge visited
+        let mut visited = vec![0u8; w * self.height];
         let mut spans: Vec<(i32, i32, i32)> = Vec::new(); // (y, left, right), inclusive
 
         let mut stack = vec![(x, y)];
         while let Some((x, y)) = stack.pop() {
-            if self.get(x, y) != Some(target) || filled[y as usize * w + x as usize] {
+            if self.get(x, y) != Some(target) || visited[y as usize * w + x as usize] != 0 {
                 continue;
             }
             // extend the span to the left and right
@@ -342,16 +379,21 @@ impl Bitmap {
             while self.get(right + 1, y) == Some(target) {
                 right += 1;
             }
+            let row_offset = y as usize * w;
             for i in left..=right {
-                filled[y as usize * w + i as usize] = true;
+                visited[row_offset + i as usize] = 1;
             }
             spans.push((y, left, right));
 
             // queue one seed per run of target pixels in the rows above and below
             for ny in [y - 1, y + 1] {
+                if ny < 0 || ny >= height {
+                    continue;
+                }
                 let mut inside = false;
+                let nrow_offset = ny as usize * w;
                 for i in left..=right {
-                    let matches = self.get(i, ny) == Some(target) && !filled[ny as usize * w + i as usize];
+                    let matches = self.get(i, ny) == Some(target) && visited[nrow_offset + i as usize] == 0;
                     if matches && !inside {
                         stack.push((i, ny));
                     }
@@ -364,32 +406,67 @@ impl Bitmap {
         // old color replaced, instead of being left behind as a halo
         let mut edges: Vec<(i32, i32, [u8; 4])> = Vec::new();
         if smooth_edges {
-            let height = self.height as i32;
-            let mut seen = filled.clone();
             for &(y, left, right) in &spans {
-                for ny in y - 1..=y + 1 {
-                    for nx in left - 1..=right + 1 {
-                        if nx < 0 || ny < 0 || nx >= w as i32 || ny >= height {
-                            continue;
+                // left and right neighbors on the same row
+                for nx in [left - 1, right + 1] {
+                    if nx >= 0 && nx < w as i32 {
+                        let i = y as usize * w + nx as usize;
+                        if visited[i] == 0 {
+                            visited[i] = 2;
+                            if let Some(c) = self.blend_edge(nx, y, target, color) {
+                                edges.push((nx, y, c));
+                            }
                         }
-                        let i = ny as usize * w + nx as usize;
-                        if seen[i] {
-                            continue;
-                        }
-                        seen[i] = true;
-                        if let Some(c) = self.blend_edge(nx, ny, target, color) {
-                            edges.push((nx, ny, c));
+                    }
+                }
+
+                // rows above and below: scan from left - 1 to right + 1
+                for ny in [y - 1, y + 1] {
+                    if ny < 0 || ny >= height {
+                        continue;
+                    }
+                    let nrow_offset = ny as usize * w;
+                    let x0 = (left - 1).max(0) as usize;
+                    let x1 = ((right + 1).min(w as i32 - 1) + 1) as usize;
+                    for nx in x0..x1 {
+                        if visited[nrow_offset + nx] == 0 {
+                            visited[nrow_offset + nx] = 2;
+                            if let Some(c) = self.blend_edge(nx as i32, ny, target, color) {
+                                edges.push((nx as i32, ny, c));
+                            }
                         }
                     }
                 }
             }
         }
 
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+
         for &(y, left, right) in &spans {
-            self.fill_rect(left, y, right - left + 1, 1, color);
+            let x0 = left.max(0);
+            let x1 = (right + 1).min(w as i32);
+            if x0 < x1 {
+                let row = y as usize * w;
+                self.pixels[row + x0 as usize..row + x1 as usize].fill(color);
+                min_x = min_x.min(x0);
+                max_x = max_x.max(x1);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y + 1);
+            }
         }
         for (x, y, c) in edges {
-            self.set(x, y, c);
+            let i = y as usize * w + x as usize;
+            self.pixels[i] = c;
+            min_x = min_x.min(x);
+            max_x = max_x.max(x + 1);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y + 1);
+        }
+        if min_x < max_x && min_y < max_y {
+            self.mark(min_x, min_y, max_x, max_y);
         }
     }
 
@@ -634,7 +711,8 @@ pub struct Application {
     shape_filled: bool,
     // anti-aliased drawing on/off, and the coverage of the stroke in progress (AA only)
     antialias: bool,
-    coverage: Option<Coverage>,
+    coverage: Coverage,
+    active_aa: bool,
     // shape preview: the bitmap before the shape and the area the preview covers
     shape_backup: Option<Bitmap>,
     shape_bounds: Option<(i32, i32, i32, i32)>,
@@ -659,6 +737,9 @@ pub struct Application {
     view_image: Option<Arc<RenderImage>>,
     view_pixels: (usize, usize),
     view_dirty: bool,
+    // reusable coordinate mapping caches for view rendering
+    xs_cache: Vec<i32>,
+    ys_cache: Vec<i32>,
     focus_handle: FocusHandle,
     // font
     font_system: Option<cosmic_text::FontSystem>,
@@ -750,10 +831,7 @@ impl Application {
         // returning false from the callback keeps the window open
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_window, cx| {
-            this.update_in(cx, |app, window, cx| {
-                app.handle_window_close(window, cx)
-            })
-            .unwrap_or(true)
+            this.update(cx, |app, cx| app.handle_window_close(cx)).unwrap_or(true)
         });
 
         let mut app = Self {
@@ -770,7 +848,8 @@ impl Application {
             brush_size: 3,
             shape_filled: false,
             antialias: true,
-            coverage: None,
+            coverage: Coverage::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1),
+            active_aa: false,
             shape_backup: None,
             shape_bounds: None,
             selection: None,
@@ -789,6 +868,8 @@ impl Application {
             view_image: None,
             view_pixels: (0, 0),
             view_dirty: true,
+            xs_cache: Vec::new(),
+            ys_cache: Vec::new(),
             focus_handle: cx.focus_handle(),
             font_system: None,
             swash_cache: None,
@@ -979,17 +1060,19 @@ impl Application {
         let bw = self.bitmap.width as i32;
         let bh = self.bitmap.height as i32;
 
-        // canvas coordinate of every device column/row (-1 = outside the canvas)
-        let map = |origin: f32, count: usize, limit: i32| -> Vec<i32> {
-            (0..count)
-                .map(|i| {
-                    let c = ((i as f32 + 0.5 - origin) / zoom).floor() as i32;
-                    if c < 0 || c >= limit { -1 } else { c }
-                })
-                .collect()
-        };
-        let xs = map(ox, w, bw);
-        let ys = map(oy, h, bh);
+        self.xs_cache.clear();
+        self.xs_cache.reserve(w);
+        for i in 0..w {
+            let c = ((i as f32 + 0.5 - ox) / zoom).floor() as i32;
+            self.xs_cache.push(if c < 0 || c >= bw { -1 } else { c });
+        }
+
+        self.ys_cache.clear();
+        self.ys_cache.reserve(h);
+        for i in 0..h {
+            let c = ((i as f32 + 0.5 - oy) / zoom).floor() as i32;
+            self.ys_cache.push(if c < 0 || c >= bh { -1 } else { c });
+        }
 
         // lifted selection pixels are drawn on top of the bitmap
         let floating = self
@@ -997,39 +1080,42 @@ impl Application {
             .as_ref()
             .and_then(|s| s.floating.as_ref().map(|f| (s.x, s.y, f)));
 
+        let [bg_r, bg_g, bg_b] = to_rgb8(invert_lightness(cx.theme().muted_foreground));
         let grid = self.zoom() >= GRID_MIN_ZOOM;
         let mut buf = vec![0u8; w * h * 4];
         for y in 0..h {
-            let cry = ys[y];
+            let cry = self.ys_cache[y];
             // first device row of a canvas pixel row
-            let on_h_line = grid && cry >= 0 && (y == 0 || ys[y - 1] != cry);
+            let on_h_line = grid && cry >= 0 && (y == 0 || self.ys_cache[y - 1] != cry);
             let row = &mut buf[y * w * 4..(y + 1) * w * 4];
             for x in 0..w {
-                let crx = xs[x];
-                let [r, g, b] = if crx < 0 || cry < 0 {
-                    to_rgb8(invert_lightness(cx.theme().muted_foreground))
-                } else {
-                    let p = match floating {
-                        Some((sx, sy, f))
-                        if crx >= sx && crx < sx + f.width as i32 && cry >= sy && cry < sy + f.height as i32 =>
-                            {
-                                f.pixels[(cry - sy) as usize * f.width + (crx - sx) as usize]
-                            }
-                        _ => self.bitmap.pixels[cry as usize * self.bitmap.width + crx as usize],
-                    };
-                    let mut c = [p[0], p[1], p[2]];
-                    // first device column of a canvas pixel column
-                    if grid && (on_h_line || x == 0 || xs[x - 1] != crx) {
-                        for v in &mut c {
-                            *v = ((*v as u16 + 0x80) / 2) as u8;
-                        }
+                let crx = self.xs_cache[x];
+                if crx < 0 || cry < 0 {
+                    row[x * 4] = bg_b;
+                    row[x * 4 + 1] = bg_g;
+                    row[x * 4 + 2] = bg_r;
+                    row[x * 4 + 3] = 0xff;
+                    continue;
+                }
+                let p = match floating {
+                    Some((sx, sy, f))
+                    if crx >= sx && crx < sx + f.width as i32 && cry >= sy && cry < sy + f.height as i32 =>
+                    {
+                        f.pixels[(cry - sy) as usize * f.width + (crx - sx) as usize]
                     }
-                    c
+                    _ => self.bitmap.pixels[cry as usize * self.bitmap.width + crx as usize],
                 };
+                let mut c = [p[0], p[1], p[2]];
+                // first device column of a canvas pixel column
+                if grid && (on_h_line || x == 0 || self.xs_cache[x - 1] != crx) {
+                    for v in &mut c {
+                        *v = ((*v as u16 + 0x80) / 2) as u8;
+                    }
+                }
                 // gpui expects BGRA
-                row[x * 4] = b;
-                row[x * 4 + 1] = g;
-                row[x * 4 + 2] = r;
+                row[x * 4] = c[2];
+                row[x * 4 + 1] = c[1];
+                row[x * 4 + 2] = c[0];
                 row[x * 4 + 3] = 0xff;
             }
         }
@@ -1338,8 +1424,8 @@ impl Application {
         // erase the previous preview
         if let Some(bounds) = self.shape_bounds {
             self.bitmap.restore_region(backup, bounds);
-            if let Some(cov) = self.coverage.as_mut() {
-                cov.clear_rect(bounds);
+            if self.active_aa {
+                self.coverage.clear_rect(bounds);
             }
         }
 
@@ -1347,7 +1433,8 @@ impl Application {
         let size = self.brush_size;
         let (x0, x1) = (start.0.min(end.0), start.0.max(end.0));
         let (y0, y1) = (start.1.min(end.1), start.1.max(end.1));
-        if let Some(cov) = self.coverage.as_mut() {
+        if self.active_aa {
+            let cov = &mut self.coverage;
             // anti-aliased: build the coverage, then composite it over the original pixels
             let r = size as f32 / 2.;
             let touched: Option<Rect> = match self.tool {
@@ -1549,12 +1636,12 @@ impl Application {
 
     // add a round-capped segment to the stroke's coverage and composite it over the saved pixels
     fn aa_segment(&mut self, from: (i32, i32), to: (i32, i32), color: [u8; 4]) {
-        let (Some(backup), Some(cov)) = (self.shape_backup.as_ref(), self.coverage.as_mut()) else {
+        let Some(backup) = self.shape_backup.as_ref() else {
             return;
         };
         let radius = self.brush_size as f32 / 2.;
-        let rect = cov.add_capsule(pixel_center(from), pixel_center(to), radius);
-        self.bitmap.composite(backup, cov, color, rect);
+        let rect = self.coverage.add_capsule(pixel_center(from), pixel_center(to), radius);
+        self.bitmap.composite(backup, &self.coverage, color, rect);
     }
 
     // -- canvas size ---------------------------------------------------------
@@ -1699,9 +1786,11 @@ impl Application {
                 if self.antialias {
                     // keep the pixels from before the stroke; the stroke is composited over them
                     self.shape_backup = Some(self.bitmap.clone());
-                    self.coverage = Some(Coverage::new(self.bitmap.width, self.bitmap.height));
+                    self.coverage.prepare(self.bitmap.width, self.bitmap.height);
+                    self.active_aa = true;
                     self.aa_segment(p, p, color);
                 } else {
+                    self.active_aa = false;
                     self.bitmap.stamp(p.0, p.1, self.brush_size, color);
                 }
             }
@@ -1725,9 +1814,10 @@ impl Application {
                 self.drag = Drag::Shape { start: p };
                 self.last_pos = p;
                 self.shape_backup = Some(self.bitmap.clone());
-                self.coverage = self
-                    .antialias
-                    .then(|| Coverage::new(self.bitmap.width, self.bitmap.height));
+                self.active_aa = self.antialias;
+                if self.active_aa {
+                    self.coverage.prepare(self.bitmap.width, self.bitmap.height);
+                }
                 self.shape_bounds = None;
                 self.draw_shape(p, p);
             }
@@ -1767,7 +1857,7 @@ impl Application {
             Drag::Draw => {
                 if p != self.last_pos {
                     let color = self.tool_color();
-                    if self.coverage.is_some() {
+                    if self.active_aa {
                         self.aa_segment(self.last_pos, p, color);
                     } else {
                         self.bitmap.line(self.last_pos, p, self.brush_size, color);
@@ -1821,13 +1911,15 @@ impl Application {
         match std::mem::replace(&mut self.drag, Drag::None) {
             Drag::Draw => {
                 self.shape_backup = None;
-                self.coverage = None;
+                self.coverage.clear_all();
+                self.active_aa = false;
                 self.record_history();
             }
             Drag::Shape { .. } => {
                 self.shape_backup = None;
                 self.shape_bounds = None;
-                self.coverage = None;
+                self.coverage.clear_all();
+                self.active_aa = false;
                 self.record_history();
             }
             Drag::SelectNew { .. } => {
@@ -1938,7 +2030,7 @@ impl Application {
 
     // -- files ---------------------------------------------------------------
 
-    fn handle_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn handle_window_close(&mut self, cx: &mut Context<Self>) -> bool {
         if self.is_saving {
             return false;
         }
@@ -1961,13 +2053,39 @@ impl Application {
                     let depth = self.undo_stack.len();
                     self.write_image_data(&bitmap, depth, path, cx)
                 } else {
-                    self.save_image(false, Some(DiscardAction::CloseWindow), window, cx);
+                    self.save_image_on_close(cx);
                     false
                 }
             }
             rfd::MessageDialogResult::No => true,
             _ => false,
         }
+    }
+
+    fn save_image_on_close(&mut self, cx: &mut Context<Self>) {
+        let dialog = self.prepare_save_dialog();
+        let current_bitmap = self.bitmap.clone();
+        let current_depth = self.undo_stack.len();
+        self.is_saving = true;
+
+        cx.spawn(async move |this, cx| {
+            let handle = dialog.save_file().await;
+            this.update(cx, |this, cx| {
+                this.is_saving = false;
+                let Some(handle) = handle else {
+                    return; // user canceled: leave the window open
+                };
+                let mut path = handle.path().to_path_buf();
+                if path.extension().is_none() {
+                    path = path.with_extension("png");
+                }
+                if this.write_image_data(&current_bitmap, current_depth, path, cx) {
+                    cx.quit();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn check_discard_and_run(
