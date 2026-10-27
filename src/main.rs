@@ -2307,28 +2307,34 @@ impl Application {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
 
         let new_button = Button::new("btn-new")
-            .ghost().small().icon(IconName::File).tooltip("New (Ctrl+N)")
+            .ghost().small().icon(IconName::File)
+            .tooltip(if cfg!(target_os = "macos") { "New (Cmd+N)" } else { "New (Ctrl+N)" })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.check_discard_and_run(DiscardAction::NewDocument, window, cx);
             }));
         let open_button = Button::new("btn-open")
-            .ghost().small().icon(IconName::FolderOpen).tooltip("Open (Ctrl+O)")
+            .ghost().small().icon(IconName::FolderOpen)
+            .tooltip(if cfg!(target_os = "macos") { "Open (Cmd+O)" } else { "Open (Ctrl+O)" })
             .on_click(cx.listener(|this, _, window, cx| this.open_image_dialog(window, cx)));
         let save_button = Button::new("btn-save")
-            .ghost().small().icon(IconName::Save).tooltip("Save (Ctrl+S)")
+            .ghost().small().icon(IconName::Save)
+            .tooltip(if cfg!(target_os = "macos") { "Save (Cmd+S)" } else { "Save (Ctrl+S)" })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.save_image(false, None, window, cx);
             }));
         let save_as_button = Button::new("btn-save-as")
-            .ghost().small().icon(IconName::SavePen).tooltip("Save As (Ctrl+Shift+S)")
+            .ghost().small().icon(IconName::SavePen)
+            .tooltip(if cfg!(target_os = "macos") { "Save As (Cmd+Shift+S)" } else { "Save As (Ctrl+Shift+S)" })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.save_image(true, None, window, cx);
             }));
         let undo_button = Button::new("btn-undo")
-            .ghost().small().icon(IconName::Undo2).tooltip("Undo (Ctrl+Z)")
+            .ghost().small().icon(IconName::Undo2)
+            .tooltip(if cfg!(target_os = "macos") { "Undo (Cmd+Z)" } else { "Undo (Ctrl+Z)" })
             .on_click(cx.listener(|this, _, window, cx| this.undo(window, cx)));
         let redo_button = Button::new("btn-redo")
-            .ghost().small().icon(IconName::Redo2).tooltip("Redo (Ctrl+Y)")
+            .ghost().small().icon(IconName::Redo2)
+            .tooltip(if cfg!(target_os = "macos") { "Redo (Cmd+Y)" } else { "Redo (Ctrl+Y)" })
             .on_click(cx.listener(|this, _, window, cx| this.redo(window, cx)));
 
         let files = div()
