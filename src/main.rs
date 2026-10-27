@@ -606,6 +606,13 @@ fn thumb(content: f32, view: f32, scroll: f32, track: f32) -> Option<Thumb> {
     Some(Thumb { start, len, track, max })
 }
 
+#[derive(Clone, Debug)]
+enum DiscardAction {
+    NewDocument,
+    LoadImage(PathBuf),
+    CloseWindow,
+}
+
 pub struct Application {
     bitmap: Bitmap,
     // the bitmap as of the last history entry, used to build patches
@@ -617,6 +624,8 @@ pub struct Application {
     saved_depth: Option<usize>,
     // file the document was opened from or last saved to (None = Untitled)
     file_path: Option<PathBuf>,
+    // true while an async save dialog is pending
+    is_saving: bool,
     tool: Tool,
     drag: Drag,
     // last pixel touched while dragging (canvas coordinates)
@@ -633,7 +642,7 @@ pub struct Application {
     // whether the mouse pointer is over the selection (decides the pointer shape)
     over_selection: bool,    // pixel under the mouse pointer, if it is inside the canvas
     cursor_px: Option<(i32, i32)>,
-    current_color: Hsla,
+    current_color: [u8; 4],
     zoom_percent: f32,
     // how far the viewport is scrolled into the content, in logical pixels (>= 0)
     scroll: (f32, f32),
@@ -696,14 +705,14 @@ impl Application {
                 .min(1.)
         });
 
-        let initial_color: Hsla = rgb(PALETTE[0]).into();
-        let color_picker = cx.new(|cx| ColorPickerState::new(window, cx).default_value(initial_color));
+        let initial_color = hex_to_rgba(PALETTE[0]);
+        let color_picker = cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgba_to_hsla(initial_color)));
 
         // reflect colors chosen in the picker popover into the drawing color
         let color_sub = cx.subscribe(&color_picker, |this, _, ev, cx| match ev {
             ColorPickerEvent::Change(color) => {
                 if let Some(color) = color {
-                    this.current_color = *color;
+                    this.current_color = to_rgba8(*color);
                     cx.notify();
                 }
             }
@@ -741,7 +750,10 @@ impl Application {
         // returning false from the callback keeps the window open
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_window, cx| {
-            this.update(cx, |app, cx| app.confirm_discard(cx)).unwrap_or(true)
+            this.update_in(cx, |app, window, cx| {
+                app.handle_window_close(window, cx)
+            })
+            .unwrap_or(true)
         });
 
         let mut app = Self {
@@ -751,6 +763,7 @@ impl Application {
             redo_stack: Vec::new(),
             saved_depth: Some(0),
             file_path: None,
+            is_saving: false,
             tool: Tool::Pencil,
             drag: Drag::None,
             last_pos: (0, 0),
@@ -786,7 +799,7 @@ impl Application {
         // open the file given on the command line (a fresh document has no changes,
         // so no confirmation dialog appears)
         if let Some(path) = initial_file {
-            app.load_image(&path, window, cx);
+            app.perform_discard_action(DiscardAction::LoadImage(path), window, cx);
         }
         app
     }
@@ -1315,7 +1328,7 @@ impl Application {
     fn tool_color(&self) -> [u8; 4] {
         match self.tool {
             Tool::Eraser => BACKGROUND,
-            _ => to_rgba8(self.current_color),
+            _ => self.current_color,
         }
     }
 
@@ -1330,7 +1343,7 @@ impl Application {
             }
         }
 
-        let color = to_rgba8(self.current_color);
+        let color = self.tool_color();
         let size = self.brush_size;
         let (x0, x1) = (start.0.min(end.0), start.0.max(end.0));
         let (y0, y1) = (start.1.min(end.1), start.1.max(end.1));
@@ -1481,7 +1494,7 @@ impl Application {
         buffer.set_text(text, &attrs, cosmic_text::Shaping::Advanced, None);
         buffer.shape_until_scroll(false);
 
-        let color = to_rgba8(self.current_color);
+        let color = self.current_color;
         let cosmic_color = cosmic_text::Color::rgba(color[0], color[1], color[2], 0xff);
 
         let antialias = self.antialias;
@@ -1668,6 +1681,9 @@ impl Application {
     // -- input handlers ------------------------------------------------------
 
     fn handle_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_saving {
+            return;
+        }
         self.focus_canvas(window, cx);
         let p = self.to_canvas_px(event.position);
         let tool = self.tool;
@@ -1690,17 +1706,17 @@ impl Application {
                 }
             }
             Tool::Fill => {
-                let color = to_rgba8(self.current_color);
+                let color = self.current_color;
                 self.bitmap.flood_fill(p.0, p.1, color, self.antialias);
                 self.record_history();
             }
             Tool::Picker => {
                 if let Some(c) = self.bitmap.get(p.0, p.1) {
-                    let color: Hsla = rgb(u32::from_be_bytes([0, c[0], c[1], c[2]])).into();
-                    self.current_color = color;
+                    self.current_color = c;
+                    let hsla = rgba_to_hsla(c);
                     // keep the picker's displayed color in sync (does not emit Change)
                     self.color_picker
-                        .update(cx, |state, cx| state.set_value(color, window, cx));
+                        .update(cx, |state, cx| state.set_value(hsla, window, cx));
                     // like classic Paint, go back to drawing after picking
                     self.tool = Tool::Pencil;
                 }
@@ -1727,6 +1743,9 @@ impl Application {
     }
 
     fn handle_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_saving {
+            return;
+        }
         let p = self.to_canvas_px(event.position);
 
         // cursor position shown in the footer
@@ -1796,6 +1815,9 @@ impl Application {
     }
 
     fn handle_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_saving {
+            return;
+        }
         match std::mem::replace(&mut self.drag, Drag::None) {
             Drag::Draw => {
                 self.shape_backup = None;
@@ -1833,13 +1855,15 @@ impl Application {
     fn handle_drop(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
         // open the first dropped file; the others are ignored
         if let Some(path) = paths.paths().first() {
-            self.load_image(path, window, cx);
+            self.check_discard_and_run(DiscardAction::LoadImage(path.clone()), window, cx);
             self.focus_canvas(window, cx);
         }
     }
 
     fn handle_scroll_wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
-
+        if self.is_saving {
+            return;
+        }
         let delta = event.delta.pixel_delta(px(20.));
 
         // Ctrl + wheel: zoom around the mouse pointer instead of scrolling
@@ -1876,7 +1900,9 @@ impl Application {
     }
 
     fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-
+        if self.is_saving {
+            return;
+        }
         // the control keep their own keyboard handling
         if self.size_select.focus_handle(cx).is_focused(window)
         || self.color_picker.focus_handle(cx).is_focused(window)
@@ -1894,9 +1920,9 @@ impl Application {
                 "y" => self.redo(window, cx),
                 "c" => self.copy_selection(cx),
                 "v" => self.paste_image(window, cx),
-                "s" => { self.save_png(key.modifiers.shift, cx); }
-                "n" => self.new_document(window, cx),
-                "o" => self.open_png(window, cx),
+                "s" => self.save_image(key.modifiers.shift, None, window, cx),
+                "n" => self.check_discard_and_run(DiscardAction::NewDocument, window, cx),
+                "o" => self.open_image_dialog(window, cx),
                 _ => {}
             }
         } else if self.focus_handle.is_focused(window) {
@@ -1912,114 +1938,10 @@ impl Application {
 
     // -- files ---------------------------------------------------------------
 
-    // returns true when the image was saved right now;
-    // when a file dialog is needed, the save finishes asynchronously and this returns false
-    fn save_png(&mut self, save_as: bool, cx: &mut Context<Self>) -> bool {
-        // make sure a moved selection is part of the saved image
-        self.commit_selection();
-        self.drag = Drag::None;
-
-        // overwrite the current file directly, but only when its format can be written
-        let existing = self.file_path.clone().filter(|p| !save_as && save_format(p).is_some());
-        if let Some(path) = existing {
-            return self.write_image(path, cx);
-        }
-
-        let mut dialog = rfd::AsyncFileDialog::new()
-            .add_filter("PNG image", &["png"])
-            .add_filter("JPEG image", &["jpg", "jpeg"])
-            .add_filter("BMP image", &["bmp"])
-            .add_filter("GIF image", &["gif"])
-            .add_filter("TIFF image", &["tif", "tiff"])
-            .add_filter("WebP image", &["webp"]);
-        // start from the current file's folder and name
-        dialog = match &self.file_path {
-            Some(p) => {
-                // keep the current extension if it can be saved, otherwise fall back to .png
-                let ext = if save_format(p).is_some() {
-                    p.extension().map(|e| e.to_string_lossy().into_owned())
-                } else {
-                    None
-                }
-                    .unwrap_or_else(|| "png".to_string());
-                let name = p
-                    .file_stem()
-                    .map(|s| format!("{}.{ext}", s.to_string_lossy()))
-                    .unwrap_or_else(|| "drawing.png".to_string());
-                if let Some(dir) = p.parent() {
-                    dialog = dialog.set_directory(dir);
-                }
-                dialog.set_file_name(name)
-            }
-            None => dialog.set_file_name("drawing.png"),
-        };
-
-        // Do not block inside the event handler: a modal dialog runs a nested run loop,
-        // and gpui callbacks fired meanwhile would hit the already borrowed App (RefCell panic).
-        cx.spawn(async move |this, cx| {
-            let Some(handle) = dialog.save_file().await else {
-                return; // canceled
-            };
-            let path = handle.path().to_path_buf();
-            // no extension: default to PNG
-            let path = if path.extension().is_none() { path.with_extension("png") } else { path };
-            this.update(cx, |this, cx| {
-                this.write_image(path, cx);
-            })
-                .ok();
-        })
-            .detach();
-        false
-    }
-
-    // encode the bitmap in the format given by the extension of `path` and write it
-    fn write_image(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
-        // the dialog was open for a while, so flatten any selection created in the meantime
-        self.commit_selection();
-
-        // the format follows the extension the user chose
-        let Some(format) = save_format(&path) else {
-            show_error("Unsupported file extension. Use png, jpg, bmp, gif, tif or webp.");
-            return false;
-        };
-
-        // the canvas is opaque, so save as RGB (JPEG and others cannot store an alpha channel)
-        let data: Vec<u8> = self.bitmap.pixels.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
-        let Some(img) = image::RgbImage::from_raw(self.bitmap.width as u32, self.bitmap.height as u32, data) else {
-            show_error("Failed to build the image.");
-            return false;
-        };
-        if let Err(e) = image::DynamicImage::ImageRgb8(img).save_with_format(&path, format) {
-            show_error(&format!("Failed to save the image: {e}"));
+    fn handle_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.is_saving {
             return false;
         }
-        self.file_path = Some(path);
-        self.saved_depth = Some(self.undo_stack.len());
-        self.mark_dirty();
-        cx.notify();
-        true
-    }
-
-    fn open_png(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let dialog = rfd::AsyncFileDialog::new()
-            .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp"]);
-        cx.spawn(async move |this, cx| {
-            let Some(handle) = dialog.pick_file().await else {
-                return; // canceled
-            };
-            let path = handle.path().to_path_buf();
-            this.update_in(cx, |this, window, cx| {
-                this.load_image(&path, window, cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    // Ask what to do with unsaved changes before the document is replaced.
-    // Returns true when it is OK to continue (nothing to save, saved, or discarded).
-    fn confirm_discard(&mut self, cx: &mut Context<Self>) -> bool {
-        // flatten a floating selection first, so that it counts as a change
         self.commit_selection();
         self.drag = Drag::None;
         if !self.is_modified() {
@@ -2032,45 +1954,215 @@ impl Application {
             .set_buttons(rfd::MessageButtons::YesNoCancel)
             .show();
         match answer {
-            rfd::MessageDialogResult::Yes => self.save_png(false, cx), // a canceled save aborts too
+            rfd::MessageDialogResult::Yes => {
+                let existing = self.file_path.clone().filter(|p| save_format(p).is_some());
+                if let Some(path) = existing {
+                    let bitmap = self.bitmap.clone();
+                    let depth = self.undo_stack.len();
+                    self.write_image_data(&bitmap, depth, path, cx)
+                } else {
+                    self.save_image(false, Some(DiscardAction::CloseWindow), window, cx);
+                    false
+                }
+            }
             rfd::MessageDialogResult::No => true,
             _ => false,
         }
     }
 
-    // start a new, empty document (asks about unsaved changes first)
-    fn new_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.confirm_discard(cx) {
+    fn check_discard_and_run(
+        &mut self,
+        action: DiscardAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_saving {
             return;
         }
-        let bitmap = Bitmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
-        // a new document has no history and no file name
-        self.replace_bitmap(bitmap, false);
-        self.file_path = None;
-        self.scroll = (0., 0.);
-        self.after_history_change(window, cx);
+        self.commit_selection();
+        self.drag = Drag::None;
+        if !self.is_modified() {
+            self.perform_discard_action(action, window, cx);
+            return;
+        }
+        let answer = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("min-paint")
+            .set_description("The image has unsaved changes. Save them first?")
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show();
+        match answer {
+            rfd::MessageDialogResult::Yes => {
+                self.save_image(false, Some(action), window, cx);
+            }
+            rfd::MessageDialogResult::No => {
+                self.perform_discard_action(action, window, cx);
+            }
+            _ => {}
+        }
     }
 
-    // open an image file as a new document (used by the Open dialog and by file drops)
-    fn load_image(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.confirm_discard(cx) {
+    fn perform_discard_action(
+        &mut self,
+        action: DiscardAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            DiscardAction::NewDocument => {
+                let bitmap = Bitmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
+                self.replace_bitmap(bitmap, false);
+                self.file_path = None;
+                self.scroll = (0., 0.);
+                self.after_history_change(window, cx);
+            }
+            DiscardAction::LoadImage(path) => {
+                let img = match image::open(&path) {
+                    Ok(img) => img.to_rgba8(),
+                    Err(e) => {
+                        show_error(&format!("Failed to open the image: {e}"));
+                        return;
+                    }
+                };
+                let bitmap = Bitmap::from(img);
+                self.replace_bitmap(bitmap, false);
+                self.file_path = Some(path);
+                self.scroll = (0., 0.);
+                self.after_history_change(window, cx);
+            }
+            DiscardAction::CloseWindow => {
+                cx.quit();
+            }
+        }
+    }
+
+    fn prepare_save_dialog(&self) -> rfd::AsyncFileDialog {
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .add_filter("PNG image", &["png"])
+            .add_filter("JPEG image", &["jpg", "jpeg"])
+            .add_filter("BMP image", &["bmp"])
+            .add_filter("GIF image", &["gif"])
+            .add_filter("TIFF image", &["tif", "tiff"])
+            .add_filter("WebP image", &["webp"]);
+
+        match &self.file_path {
+            Some(p) => {
+                let ext = if save_format(p).is_some() {
+                    p.extension().map(|e| e.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| "png".to_string());
+                let name = p
+                    .file_stem()
+                    .map(|s| format!("{}.{ext}", s.to_string_lossy()))
+                    .unwrap_or_else(|| "drawing.png".to_string());
+                if let Some(dir) = p.parent() {
+                    dialog = dialog.set_directory(dir);
+                }
+                dialog.set_file_name(name)
+            }
+            None => dialog.set_file_name("drawing.png"),
+        }
+    }
+
+    fn save_image(
+        &mut self,
+        save_as: bool,
+        continuation: Option<DiscardAction>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_saving {
+            return;
+        }
+        self.commit_selection();
+        self.drag = Drag::None;
+
+        let existing = self.file_path.clone().filter(|p| !save_as && save_format(p).is_some());
+        if let Some(path) = existing {
+            let bitmap = self.bitmap.clone();
+            let depth = self.undo_stack.len();
+            if self.write_image_data(&bitmap, depth, path, cx) {
+                if let Some(action) = continuation {
+                    self.perform_discard_action(action, window, cx);
+                }
+            }
             return;
         }
 
-        let img = match image::open(path) {
-            Ok(img) => img.to_rgba8(),
-            Err(e) => {
-                show_error(&format!("Failed to open the image: {e}"));
-                return;
-            }
+        let dialog = self.prepare_save_dialog();
+        let current_bitmap = self.bitmap.clone();
+        let current_depth = self.undo_stack.len();
+        self.is_saving = true;
+
+        cx.spawn(async move |this, cx| {
+            let handle = dialog.save_file().await;
+            this.update_in(cx, |this, window, cx| {
+                this.is_saving = false;
+                let Some(handle) = handle else {
+                    return; // user canceled
+                };
+                let mut path = handle.path().to_path_buf();
+                if path.extension().is_none() {
+                    path = path.with_extension("png");
+                }
+                if this.write_image_data(&current_bitmap, current_depth, path, cx) {
+                    if let Some(action) = continuation {
+                        this.perform_discard_action(action, window, cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn write_image_data(
+        &mut self,
+        bitmap: &Bitmap,
+        saved_depth: usize,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(format) = save_format(&path) else {
+            show_error("Unsupported file extension. Use png, jpg, bmp, gif, tif or webp.");
+            return false;
         };
 
-        // opening a file starts a new document: the history is cleared
-        let bitmap = Bitmap::from(img);
-        self.replace_bitmap(bitmap, false);
-        self.file_path = Some(path.to_path_buf());
-        self.scroll = (0., 0.);
-        self.after_history_change(window, cx);
+        let data: Vec<u8> = bitmap.pixels.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let Some(img) = image::RgbImage::from_raw(bitmap.width as u32, bitmap.height as u32, data) else {
+            show_error("Failed to build the image.");
+            return false;
+        };
+        if let Err(e) = image::DynamicImage::ImageRgb8(img).save_with_format(&path, format) {
+            show_error(&format!("Failed to save the image: {e}"));
+            return false;
+        }
+        self.file_path = Some(path);
+        self.saved_depth = Some(saved_depth);
+        self.mark_dirty();
+        cx.notify();
+        true
+    }
+
+    fn open_image_dialog(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_saving {
+            return;
+        }
+        let dialog = rfd::AsyncFileDialog::new()
+            .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp"]);
+        cx.spawn(async move |this, cx| {
+            let Some(handle) = dialog.pick_file().await else {
+                return; // canceled
+            };
+            let path = handle.path().to_path_buf();
+            this.update_in(cx, |this, window, cx| {
+                this.check_discard_and_run(DiscardAction::LoadImage(path), window, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // -- UI ------------------------------------------------------------------
@@ -2098,16 +2190,22 @@ impl Application {
 
         let new_button = Button::new("btn-new")
             .ghost().small().icon(IconName::File).tooltip("New (Ctrl+N)")
-            .on_click(cx.listener(|this, _, window, cx| this.new_document(window, cx)));
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.check_discard_and_run(DiscardAction::NewDocument, window, cx);
+            }));
         let open_button = Button::new("btn-open")
             .ghost().small().icon(IconName::FolderOpen).tooltip("Open (Ctrl+O)")
-            .on_click(cx.listener(|this, _, window, cx| this.open_png(window, cx)));
+            .on_click(cx.listener(|this, _, window, cx| this.open_image_dialog(window, cx)));
         let save_button = Button::new("btn-save")
             .ghost().small().icon(IconName::Save).tooltip("Save (Ctrl+S)")
-            .on_click(cx.listener(|this, _, _, cx| { this.save_png(false, cx); }));
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.save_image(false, None, window, cx);
+            }));
         let save_as_button = Button::new("btn-save-as")
             .ghost().small().icon(IconName::SavePen).tooltip("Save As (Ctrl+Shift+S)")
-            .on_click(cx.listener(|this, _, _, cx| { this.save_png(true, cx); }));
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.save_image(true, None, window, cx);
+            }));
         let undo_button = Button::new("btn-undo")
             .ghost().small().icon(IconName::Undo2).tooltip("Undo (Ctrl+Z)")
             .on_click(cx.listener(|this, _, window, cx| this.undo(window, cx)));
@@ -2191,13 +2289,14 @@ impl Application {
             .w(px(SWATCH_SIZE * 2. + 4.));
 
         for hex in PALETTE {
-            let color: Hsla = rgb(hex).into();
-            let selected = self.current_color == color;
+            let rgba = hex_to_rgba(hex);
+            let hsla = rgba_to_hsla(rgba);
+            let selected = self.current_color[0..3] == rgba[0..3];
             grid = grid.child(
                 div()
                     .w(px(SWATCH_SIZE))
                     .h(px(SWATCH_SIZE))
-                    .bg(color)
+                    .bg(hsla)
                     .border_2()
                     .border_color(if selected { cx.theme().accent_foreground } else { cx.theme().border })
                     .cursor(CursorStyle::PointingHand)
@@ -2205,10 +2304,10 @@ impl Application {
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
                             // change the drawing color for subsequent operations
-                            this.current_color = color;
+                            this.current_color = rgba;
                             // keep the picker's displayed color in sync (does not emit Change)
                             this.color_picker
-                                .update(cx, |state, cx| state.set_value(color, window, cx));
+                                .update(cx, |state, cx| state.set_value(hsla, window, cx));
                             cx.notify();
                         }),
                     ),
@@ -2469,6 +2568,25 @@ impl Render for Application {
             )
             .child(footer)
     }
+}
+
+/// convert an RGBA pixel into gpui HSLA
+fn rgba_to_hsla(rgba: [u8; 4]) -> Hsla {
+    let r = rgba[0] as f32 / 255.;
+    let g = rgba[1] as f32 / 255.;
+    let b = rgba[2] as f32 / 255.;
+    let a = rgba[3] as f32 / 255.;
+    Rgba { r, g, b, a }.into()
+}
+
+/// unpack 0xRRGGBB into [r, g, b, 255]
+fn hex_to_rgba(hex: u32) -> [u8; 4] {
+    [
+        ((hex >> 16) & 0xff) as u8,
+        ((hex >> 8) & 0xff) as u8,
+        (hex & 0xff) as u8,
+        0xff,
+    ]
 }
 
 /// convert a gpui color into an opaque RGBA pixel
