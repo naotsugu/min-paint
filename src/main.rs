@@ -16,6 +16,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::Theme;
+use rfd::MessageDialogResult;
 
 // palette (column-major pairs: top row, bottom row)
 const PALETTE: [u32; 20] = [
@@ -2059,12 +2060,7 @@ impl Application {
         if !self.is_modified() {
             return true;
         }
-        let answer = rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title("min-paint")
-            .set_description("The image has unsaved changes. Save them first?")
-            .set_buttons(rfd::MessageButtons::YesNoCancel)
-            .show();
+        let answer = confirm_unsaved();
         match answer {
             rfd::MessageDialogResult::Yes => {
                 let existing = self.file_path.clone().filter(|p| save_format(p).is_some());
@@ -2123,12 +2119,7 @@ impl Application {
             self.perform_discard_action(action, window, cx);
             return;
         }
-        let answer = rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title("min-paint")
-            .set_description("The image has unsaved changes. Save them first?")
-            .set_buttons(rfd::MessageButtons::YesNoCancel)
-            .show();
+        let answer = confirm_unsaved();
         match answer {
             rfd::MessageDialogResult::Yes => {
                 self.save_image(false, Some(action), window, cx);
@@ -2563,6 +2554,8 @@ impl Application {
     }
 }
 
+
+
 impl Render for Application {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
 
@@ -2752,6 +2745,16 @@ fn invert_lightness(color: Hsla) -> Hsla {
 /// the image format of a path, if it can be written with the `image` crate
 fn save_format(path: &Path) -> Option<image::ImageFormat> {
     image::ImageFormat::from_path(path).ok().filter(|f| f.can_write())
+}
+
+/// ask whether unsaved changes should be saved first
+fn confirm_unsaved() -> rfd::MessageDialogResult {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("min-paint")
+        .set_description("The image has unsaved changes. Save them first?")
+        .set_buttons(rfd::MessageButtons::YesNoCancel)
+        .show()
 }
 
 fn show_error(message: &str) {
