@@ -1265,6 +1265,26 @@ impl Application {
         self.mark_dirty();
     }
 
+    // select the whole canvas
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        // ignore the shortcut while a drag (stroke, shape, selection, scrollbar) is in progress
+        if !matches!(self.drag, Drag::None) {
+            return;
+        }
+        // flatten the current selection first, so that moved pixels are not lost
+        self.commit_selection();
+        self.tool = Tool::Select;
+        self.selection = Some(Selection {
+            x: 0,
+            y: 0,
+            w: self.bitmap.width as i32,
+            h: self.bitmap.height as i32,
+            floating: None,
+        });
+        self.mark_dirty();
+        cx.notify();
+    }
+
     fn delete_selection(&mut self, cx: &mut Context<Self>) {
         let Some(sel) = self.selection.take() else { return };
         // lifted pixels already left a hole behind, so only an unlifted selection needs clearing
@@ -2010,6 +2030,7 @@ impl Application {
                 "z" if key.modifiers.shift => self.redo(window, cx),
                 "z" => self.undo(window, cx),
                 "y" => self.redo(window, cx),
+                "a" => self.select_all(cx),
                 "c" => self.copy_selection(cx),
                 "v" => self.paste_image(window, cx),
                 "s" => self.save_image(key.modifiers.shift, None, window, cx),
