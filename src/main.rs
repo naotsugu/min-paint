@@ -16,7 +16,6 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::Theme;
-use rfd::MessageDialogResult;
 
 // palette (column-major pairs: top row, bottom row)
 const PALETTE: [u32; 20] = [
@@ -663,6 +662,9 @@ enum Drag {
     // `grab` is the offset (in logical pixels) between the pointer and the thumb start
     ScrollbarX { grab: f32 },
     ScrollbarY { grab: f32 },
+    // right-button drag scrolls the viewport;
+    // `last` is the previous pointer position in window coordinates (logical pixels)
+    Pan { last: (f32, f32) },
 }
 
 /// Geometry of one scrollbar thumb, in logical pixels.
@@ -1788,7 +1790,8 @@ impl Application {
     // -- input handlers ------------------------------------------------------
 
     fn handle_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_saving {
+        // also ignore the left button while panning
+        if self.is_saving || matches!(self.drag, Drag::Pan { .. }) {
             return;
         }
         self.focus_canvas(window, cx);
@@ -1918,6 +1921,15 @@ impl Application {
                 self.set_scroll_from_thumb(true, f32::from(event.position.y - origin.y), grab);
                 changed = true;
             }
+            Drag::Pan { last } => {
+                let now = (f32::from(event.position.x), f32::from(event.position.y));
+                self.scroll.0 -= now.0 - last.0;
+                self.scroll.1 -= now.1 - last.1;
+                self.drag = Drag::Pan { last: now };
+                self.clamp_scroll();
+                self.mark_dirty();
+                changed = true;
+            }
         }
         if changed {
             cx.notify();
@@ -1925,7 +1937,8 @@ impl Application {
     }
 
     fn handle_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_saving {
+        // releasing the left button must not end a pan
+        if self.is_saving || matches!(self.drag, Drag::Pan { .. }) {
             return;
         }
         match std::mem::replace(&mut self.drag, Drag::None) {
@@ -1948,11 +1961,7 @@ impl Application {
                     self.selection = None;
                 }
             }
-            // the move is recorded as one step when the selection is flattened
-            Drag::SelectMove { .. }
-            | Drag::ScrollbarX { .. }
-            | Drag::ScrollbarY { .. }
-            | Drag::None => {}
+            _ => {}
         }
 
         // the selection may have just been created, moved or cleared
@@ -1961,6 +1970,26 @@ impl Application {
 
         self.mark_dirty();
         cx.notify();
+    }
+
+    // start panning with the right button (only when nothing else is being dragged)
+    fn handle_right_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_saving || !matches!(self.drag, Drag::None) {
+            return;
+        }
+        self.focus_canvas(window, cx);
+        self.drag = Drag::Pan {
+            last: (f32::from(event.position.x), f32::from(event.position.y)),
+        };
+        cx.notify(); // refresh the pointer shape
+    }
+
+    // stop panning when the right button is released
+    fn handle_right_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.drag, Drag::Pan { .. }) {
+            self.drag = Drag::None;
+            cx.notify();
+        }
     }
 
     // end an in-progress stroke or shape the same way a mouse release does,
@@ -2599,7 +2628,7 @@ impl Render for Application {
 
         // pointer shape: closed hand while moving the selection, open hand over it
         let pointer = match self.drag {
-            Drag::SelectMove { .. } => CursorStyle::ClosedHand,
+            Drag::SelectMove { .. } | Drag::Pan { .. } => CursorStyle::ClosedHand,
             Drag::None if self.over_selection && self.selection.is_some() => CursorStyle::OpenHand,
             _ => if self.tool == Tool::Text { CursorStyle::IBeam } else { CursorStyle::Crosshair },
         };
@@ -2619,6 +2648,9 @@ impl Render for Application {
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::handle_right_mouse_down))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::handle_right_mouse_up))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::handle_right_mouse_up))
             .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
             .on_drop(cx.listener(Self::handle_drop))
             // the image is generated at device resolution, so it is shown 1:1
