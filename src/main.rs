@@ -1963,6 +1963,21 @@ impl Application {
         cx.notify();
     }
 
+    // end an in-progress stroke or shape the same way a mouse release does,
+    // so that its pixels are recorded in the history before any discard check
+    fn finish_drag(&mut self) {
+        match std::mem::replace(&mut self.drag, Drag::None) {
+            Drag::Draw | Drag::Shape { .. } => {
+                self.shape_backup = None;
+                self.shape_bounds = None;
+                self.coverage.clear_all();
+                self.active_aa = false;
+                self.record_history();
+            }
+            _ => {}
+        }
+    }
+
     // a file was dropped from the OS onto the viewport
     fn handle_drop(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
         // open the first dropped file; the others are ignored
@@ -2055,8 +2070,8 @@ impl Application {
         if self.is_saving {
             return false;
         }
+        self.finish_drag();
         self.commit_selection();
-        self.drag = Drag::None;
         if !self.is_modified() {
             return true;
         }
@@ -2113,8 +2128,8 @@ impl Application {
         if self.is_saving {
             return;
         }
+        self.finish_drag();
         self.commit_selection();
-        self.drag = Drag::None;
         if !self.is_modified() {
             self.perform_discard_action(action, window, cx);
             return;
@@ -2202,8 +2217,8 @@ impl Application {
         if self.is_saving {
             return;
         }
+        self.finish_drag();
         self.commit_selection();
-        self.drag = Drag::None;
 
         let existing = self.file_path.clone().filter(|p| !save_as && save_format(p).is_some());
         if let Some(path) = existing {
