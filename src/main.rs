@@ -687,7 +687,6 @@ fn thumb(content: f32, view: f32, scroll: f32, track: f32) -> Option<Thumb> {
 enum DiscardAction {
     NewDocument,
     LoadImage(PathBuf),
-    CloseWindow,
 }
 
 pub struct Application {
@@ -2168,9 +2167,6 @@ impl Application {
                 self.file_path = Some(path);
                 self.scroll = (0., 0.);
                 self.after_history_change(window, cx);
-            }
-            DiscardAction::CloseWindow => {
-                cx.quit();
             }
         }
     }
