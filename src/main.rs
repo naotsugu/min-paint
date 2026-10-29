@@ -207,15 +207,15 @@ impl Coverage {
 /// An opaque RGBA bitmap: the source of truth of the document.
 /// It tracks the bounding box of modified pixels so that history entries stay small.
 #[derive(Clone)]
-struct Bitmap {
+struct Pixmap {
     width: usize,
     height: usize,
     pixels: Vec<[u8; 4]>,
     // modified area since the last history entry: (x0, y0, x1, y1), end-exclusive
-    dirty: Option<(i32, i32, i32, i32)>,
+    dirty: Option<Rect>,
 }
 
-impl Bitmap {
+impl Pixmap {
     fn new(width: usize, height: usize, fill: [u8; 4]) -> Self {
         Self { width, height, pixels: vec![fill; width * height], dirty: None }
     }
@@ -509,8 +509,8 @@ impl Bitmap {
     }
 
     /// Copy a rectangle into a new bitmap (pixels outside of this bitmap become background).
-    fn copy_region(&self, x: i32, y: i32, w: i32, h: i32) -> Bitmap {
-        let mut out = Bitmap::new(w.max(1) as usize, h.max(1) as usize, BACKGROUND);
+    fn copy_region(&self, x: i32, y: i32, w: i32, h: i32) -> Pixmap {
+        let mut out = Pixmap::new(w.max(1) as usize, h.max(1) as usize, BACKGROUND);
         for yy in 0..h {
             for xx in 0..w {
                 if let Some(p) = self.get(x + xx, y + yy) {
@@ -522,7 +522,7 @@ impl Bitmap {
     }
 
     /// Overwrite a part of this bitmap with `src` placed at (x, y), clipped.
-    fn paste(&mut self, src: &Bitmap, x: i32, y: i32) {
+    fn paste(&mut self, src: &Pixmap, x: i32, y: i32) {
         for sy in 0..src.height as i32 {
             let dy = y + sy;
             if dy < 0 || dy >= self.height as i32 {
@@ -546,7 +546,7 @@ impl Bitmap {
     }
 
     /// Restore a rectangle from `src` (a bitmap of the same size), clipped.
-    fn restore_region(&mut self, src: &Bitmap, rect: (i32, i32, i32, i32)) {
+    fn restore_region(&mut self, src: &Pixmap, rect: Rect) {
         let x0 = rect.0.max(0);
         let y0 = rect.1.max(0);
         let x1 = rect.2.min(self.width as i32);
@@ -563,7 +563,7 @@ impl Bitmap {
     }
 
     /// Set the pixels of `rect` to the backup mixed with `color` by the coverage.
-    fn composite(&mut self, backup: &Bitmap, cov: &Coverage, color: [u8; 4], rect: Rect) {
+    fn composite(&mut self, backup: &Pixmap, cov: &Coverage, color: [u8; 4], rect: Rect) {
         let x0 = rect.0.max(0);
         let y0 = rect.1.max(0);
         let x1 = rect.2.min(self.width as i32);
@@ -619,8 +619,8 @@ enum Edit {
     },
     // used when the canvas size changes
     Replace {
-        before: Bitmap,
-        after: Bitmap,
+        before: Pixmap,
+        after: Pixmap,
     },
 }
 
@@ -630,7 +630,7 @@ struct Selection {
     y: i32,
     w: i32,
     h: i32,
-    floating: Option<Bitmap>,
+    floating: Option<Pixmap>,
 }
 impl Selection {
     fn contains(&self, p: (i32, i32)) -> bool {
@@ -693,9 +693,9 @@ enum DiscardAction {
 }
 
 pub struct Application {
-    bitmap: Bitmap,
+    bitmap: Pixmap,
     // the bitmap as of the last history entry, used to build patches
-    committed: Bitmap,
+    committed: Pixmap,
     undo_stack: Vec<Edit>,
     redo_stack: Vec<Edit>,
     // undo depth of the saved (or freshly opened) document state;
@@ -716,8 +716,8 @@ pub struct Application {
     coverage: Coverage,
     active_aa: bool,
     // shape preview: the bitmap before the shape and the area the preview covers
-    shape_backup: Option<Bitmap>,
-    shape_bounds: Option<(i32, i32, i32, i32)>,
+    shape_backup: Option<Pixmap>,
+    shape_bounds: Option<Rect>,
     selection: Option<Selection>,
     // whether the mouse pointer is over the selection (decides the pointer shape)
     over_selection: bool,    // pixel under the mouse pointer, if it is inside the canvas
@@ -818,7 +818,7 @@ impl Application {
             }
         });
 
-        let bitmap = Bitmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
+        let bitmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
 
         // follow the OS appearance (light / dark): apply it now and whenever it changes
         Theme::sync_system_appearance(Some(window), cx);
@@ -1239,7 +1239,7 @@ impl Application {
     }
 
     // replace the whole bitmap (resize / open); `record` makes it undoable
-    fn replace_bitmap(&mut self, new_bitmap: Bitmap, record: bool) {
+    fn replace_bitmap(&mut self, new_bitmap: Pixmap, record: bool) {
         self.selection = None;
         self.drag = Drag::None;
         if record {
@@ -1367,7 +1367,7 @@ impl Application {
             show_error(&format!("The clipboard image must be at most {MAX_CANVAS_SIZE} px on each side."));
             return;
         }
-        let pasted = Bitmap::from(decoded);
+        let pasted = Pixmap::from(decoded);
 
         // flatten the previous selection first
         self.commit_selection();
@@ -1375,7 +1375,7 @@ impl Application {
         // grow the canvas when the image does not fit (undoable)
         if w > self.bitmap.width || h > self.bitmap.height {
             let (old_w, old_h) = (self.bitmap.width, self.bitmap.height);
-            let mut grown = Bitmap::new(w.max(old_w), h.max(old_h), BACKGROUND);
+            let mut grown = Pixmap::new(w.max(old_w), h.max(old_h), BACKGROUND);
             let data = self.bitmap.read_region(0, 0, old_w, old_h);
             grown.write_region(0, 0, old_w, old_h, &data);
             self.replace_bitmap(grown, true);
@@ -1704,7 +1704,7 @@ impl Application {
         // flatten a floating selection so that its pixels are part of the trimmed image
         self.commit_selection();
 
-        // trim at (ox, oy); the part outside of the current canvas becomes the background
+        // trim at (ox, oy); the part outside the current canvas becomes the background
         let new_bitmap = self.bitmap.copy_region(ox, oy, width as i32, height as i32);
 
         self.replace_bitmap(new_bitmap, true);
@@ -2183,7 +2183,7 @@ impl Application {
     ) {
         match action {
             DiscardAction::NewDocument => {
-                let bitmap = Bitmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
+                let bitmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
                 self.replace_bitmap(bitmap, false);
                 self.file_path = None;
                 self.scroll = (0., 0.);
@@ -2197,7 +2197,7 @@ impl Application {
                         return;
                     }
                 };
-                let bitmap = Bitmap::from(img);
+                let bitmap = Pixmap::from(img);
                 self.replace_bitmap(bitmap, false);
                 self.file_path = Some(path);
                 self.scroll = (0., 0.);
@@ -2290,7 +2290,7 @@ impl Application {
 
     fn write_image_data(
         &mut self,
-        bitmap: &Bitmap,
+        bitmap: &Pixmap,
         saved_depth: usize,
         path: PathBuf,
         cx: &mut Context<Self>,
