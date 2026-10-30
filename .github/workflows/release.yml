@@ -72,7 +72,6 @@ jobs:
           chmod +x staging/min-paint
           cp assets/linux/min-paint.desktop staging/
           cp assets/linux/min-paint.png staging/
-          cp README.md LICENSE staging/
           cd staging
           zip -r ../${{ matrix.platform.archive_name }} ./*
 
@@ -111,8 +110,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path staging
           Copy-Item target/${{ matrix.platform.targets }}/release/min-paint.exe staging/
-          Copy-Item README.md staging/
-          Copy-Item LICENSE staging/
           Compress-Archive -Path staging/* -DestinationPath ${{ matrix.platform.archive_name }}
 
       # --- Upload build artifact ---
@@ -144,8 +141,8 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Publish Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # env:
+        #  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ github.ref_name }}" \
             --title "min-paint ${{ github.ref_name }}" \
