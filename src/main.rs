@@ -2898,8 +2898,6 @@ impl Application {
     }
 }
 
-
-
 impl Render for Application {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
 
@@ -3169,11 +3167,8 @@ fn main() {
             }
         }
     });
-
     app.run(move |cx| {
-
         init(cx);
-
         let window_options = window_options(cx);
         open_window(window_options, cx, move |window, cx| {
             let open_rx = open_rx.borrow_mut().take();
@@ -3188,7 +3183,6 @@ fn main() {
         }).detach();
 
         cx.activate(true);
-
     });
 }
 
