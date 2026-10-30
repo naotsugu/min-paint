@@ -3698,6 +3698,7 @@ name = "min-paint"
 version = "0.1.0"
 dependencies = [
  "cosmic-text",
+ "futures",
  "gpui-kit",
  "image",
  "rfd",

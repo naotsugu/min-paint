@@ -12,5 +12,33 @@
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+      <dict>
+        <key>CFBundleTypeName</key><string>Image</string>
+        <key>CFBundleTypeRole</key><string>Editor</string>
+        <key>LSHandlerRank</key><string>Alternate</string>
+        <key>LSItemContentTypes</key>
+        <array>
+          <string>public.png</string>
+          <string>public.jpeg</string>
+          <string>com.microsoft.bmp</string>
+          <string>com.compuserve.gif</string>
+          <string>public.tiff</string>
+          <string>org.webmproject.webp</string>
+        </array>
+        <key>CFBundleTypeExtensions</key>
+        <array>
+          <string>png</string>
+          <string>jpg</string>
+          <string>jpeg</string>
+          <string>bmp</string>
+          <string>gif</string>
+          <string>tif</string>
+          <string>tiff</string>
+          <string>webp</string>
+        </array>
+      </dict>
+    </array>
 </dict>
 </plist>

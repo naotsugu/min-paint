@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use futures::channel::mpsc::UnboundedReceiver;
+use futures::StreamExt as _;
 use gpui_kit::*;
 use gpui_kit::assets::{AllAssets, IconName};
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
@@ -997,8 +999,12 @@ pub struct Application {
 }
 
 impl Application {
-    fn new(initial_file: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-
+    fn new(
+        initial_file: Option<PathBuf>,
+        open_rx: Option<UnboundedReceiver<PathBuf>>,
+        window: &mut Window,
+        cx: &mut Context<Self>) -> Self
+    {
         // brush size select
         let size_select = cx.new(|cx| {
             SelectState::new(
@@ -1125,11 +1131,30 @@ impl Application {
         };
         // give the canvas the keyboard focus at startup so that the shortcuts work at once
         window.focus(&app.focus_handle, cx);
+
         // open the file given on the command line (a fresh document has no changes,
         // so no confirmation dialog appears)
         if let Some(path) = initial_file {
             app.perform_discard_action(DiscardAction::LoadImage(path), window, cx);
         }
+
+        // files requested by the OS after startup (Finder "Open With", drop on the Dock icon, ...)
+        if let Some(mut rx) = open_rx {
+            cx.spawn(async move |this, cx| {
+                while let Some(path) = rx.next().await {
+                    let alive = this.update_in(cx, |this, window, cx| {
+                        window.activate_window();
+                        // asks about unsaved changes first, like the Open dialog does
+                        this.check_discard_and_run(DiscardAction::LoadImage(path), window, cx);
+                    });
+                    if alive.is_err() {
+                        break; // the view is gone
+                    }
+                }
+            })
+            .detach();
+        }
+
         app
     }
 
@@ -3035,7 +3060,7 @@ fn rgba_to_hsla(rgba: [u8; 4]) -> Hsla {
     Rgba { r, g, b, a }.into()
 }
 
-/// unpack 0xRRGGBB into [r, g, b, 255]
+/// unpack `0xRRGGBB` into `[r, g, b, 255]`
 fn hex_to_rgba(hex: u32) -> [u8; 4] {
     [
         ((hex >> 16) & 0xff) as u8,
@@ -3062,6 +3087,34 @@ fn invert_lightness(color: Hsla) -> Hsla {
         l: 1.0 - color.l,
         ..color
     }
+}
+
+/// Convert a `file://` URL delivered by the OS into a path (percent-decoded).
+/// Anything that is not a file URL is ignored.
+fn url_to_path(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    // skip an optional host such as "localhost"; the path starts at the next '/'
+    let path = &rest[rest.find('/')?..];
+
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(b) = hex {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok().map(PathBuf::from)
 }
 
 /// the image format of a path, if it can be written with the `image` crate
@@ -3102,13 +3155,29 @@ fn main() {
     // the first command line argument is the image file to open
     let initial_file: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
 
-    application().with_assets(AllAssets).run(move |cx| {
+    // open requests from the OS (Finder) are forwarded to the UI through a channel;
+    // events that arrive before the window exists are buffered
+    let (open_tx, open_rx) = futures::channel::mpsc::unbounded::<PathBuf>();
+    let open_rx = Rc::new(RefCell::new(Some(open_rx)));
+
+    let app = application().with_assets(AllAssets);
+    app.on_open_urls(move |urls| {
+        // must be registered before `run`, so that no request is missed at launch
+        for url in urls {
+            if let Some(path) = url_to_path(&url) {
+                let _ = open_tx.unbounded_send(path);
+            }
+        }
+    });
+
+    app.run(move |cx| {
 
         init(cx);
 
         let window_options = window_options(cx);
         open_window(window_options, cx, move |window, cx| {
-            cx.new(|cx| Application::new(initial_file.clone(), window, cx))
+            let open_rx = open_rx.borrow_mut().take();
+            cx.new(|cx| Application::new(initial_file.clone(), open_rx, window, cx))
         })
         .expect("failed to open window");
 
