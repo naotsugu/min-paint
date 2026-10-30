@@ -206,7 +206,7 @@ impl Coverage {
     }
 }
 
-/// An opaque RGBA bitmap: the source of truth of the document.
+/// An opaque RGBA pixel map: the source of truth of the document.
 /// It tracks the bounding box of modified pixels so that history entries stay small.
 #[derive(Clone)]
 struct Pixmap {
@@ -234,7 +234,7 @@ impl Pixmap {
         Self { width, height, pixels, dirty: None }
     }
 
-    // grow the dirty area; the given rectangle must already be clipped to the bitmap
+    // grow the dirty area; the given rectangle must already be clipped to the pixel map
     fn mark(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
         if x0 >= x1 || y0 >= y1 {
             return;
@@ -260,7 +260,7 @@ impl Pixmap {
         self.mark(x, y, x + 1, y + 1);
     }
 
-    /// Fill a rectangle, clipped to the bitmap.
+    /// Fill a rectangle, clipped to the pixel map.
     fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: [u8; 4]) {
         let x0 = x.max(0);
         let y0 = y.max(0);
@@ -510,7 +510,7 @@ impl Pixmap {
         Some(out)
     }
 
-    /// Copy a rectangle into a new bitmap (pixels outside of this bitmap become background).
+    /// Copy a rectangle into a new pixel map (pixels outside of this pixel map become background).
     fn copy_region(&self, x: i32, y: i32, w: i32, h: i32) -> Pixmap {
         let mut out = Pixmap::new(w.max(1) as usize, h.max(1) as usize, BACKGROUND);
         for yy in 0..h {
@@ -523,7 +523,7 @@ impl Pixmap {
         out
     }
 
-    /// Overwrite a part of this bitmap with `src` placed at (x, y), clipped.
+    /// Overwrite a part of this pixel map with `src` placed at (x, y), clipped.
     fn paste(&mut self, src: &Pixmap, x: i32, y: i32) {
         for sy in 0..src.height as i32 {
             let dy = y + sy;
@@ -547,7 +547,7 @@ impl Pixmap {
         );
     }
 
-    /// Restore a rectangle from `src` (a bitmap of the same size), clipped.
+    /// Restore a rectangle from `src` (a pixel map of the same size), clipped.
     fn restore_region(&mut self, src: &Pixmap, rect: Rect) {
         let x0 = rect.0.max(0);
         let y0 = rect.1.max(0);
@@ -697,7 +697,7 @@ enum DiscardAction {
 /// Native clipboard writer for Windows.
 /// gpui only publishes the registered "PNG" format, so apps that read CF_DIB /
 /// CF_BITMAP / CF_DIBV5 cannot paste the image. Windows synthesizes the other
-/// bitmap formats from CF_DIB automatically.
+/// pixel map formats from CF_DIB automatically.
 #[cfg(windows)]
 mod win_clipboard {
     use std::ffi::c_void;
@@ -941,8 +941,8 @@ mod win_clipboard {
 }
 
 pub struct Application {
-    bitmap: Pixmap,
-    // the bitmap as of the last history entry, used to build patches
+    pixmap: Pixmap,
+    // the pixel map as of the last history entry, used to build patches
     committed: Pixmap,
     undo_stack: Vec<Edit>,
     redo_stack: Vec<Edit>,
@@ -963,7 +963,7 @@ pub struct Application {
     antialias: bool,
     coverage: Coverage,
     active_aa: bool,
-    // shape preview: the bitmap before the shape and the area the preview covers
+    // shape preview: the pixel map before the shape and the area the preview covers
     shape_backup: Option<Pixmap>,
     shape_bounds: Option<Rect>,
     selection: Option<Selection>,
@@ -983,7 +983,7 @@ pub struct Application {
     viewport_size: Size<Pixels>,
     // viewport origin in window coordinates, recorded every frame during prepaint
     viewport_origin: Rc<Cell<Point<Pixels>>>,
-    // the visible part of the bitmap, already magnified (device pixel resolution)
+    // the visible part of the pixel map, already magnified (device pixel resolution)
     view_image: Option<Arc<RenderImage>>,
     view_pixels: (usize, usize),
     view_dirty: bool,
@@ -1070,7 +1070,7 @@ impl Application {
             }
         });
 
-        let bitmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
+        let pixmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
 
         // follow the OS appearance (light / dark): apply it now and whenever it changes
         Theme::sync_system_appearance(Some(window), cx);
@@ -1089,8 +1089,8 @@ impl Application {
         });
 
         let mut app = Self {
-            committed: bitmap.clone(),
-            bitmap,
+            committed: pixmap.clone(),
+            pixmap,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             saved_depth: Some(0),
@@ -1180,8 +1180,8 @@ impl Application {
         let view_w = f32::from(self.viewport_size.width);
         let view_h = f32::from(self.viewport_size.height);
         (
-            (self.bitmap.width as f32 * zoom + CANVAS_MARGIN * 2.).max(view_w),
-            (self.bitmap.height as f32 * zoom + CANVAS_MARGIN * 2.).max(view_h),
+            (self.pixmap.width as f32 * zoom + CANVAS_MARGIN * 2.).max(view_w),
+            (self.pixmap.height as f32 * zoom + CANVAS_MARGIN * 2.).max(view_h),
         )
     }
 
@@ -1250,8 +1250,8 @@ impl Application {
         let zoom = self.zoom();
         let (content_w, content_h) = self.content_size(zoom);
         (
-            (content_w - self.bitmap.width as f32 * zoom) / 2. - self.scroll.0,
-            (content_h - self.bitmap.height as f32 * zoom) / 2. - self.scroll.1,
+            (content_w - self.pixmap.width as f32 * zoom) / 2. - self.scroll.0,
+            (content_h - self.pixmap.height as f32 * zoom) / 2. - self.scroll.1,
         )
     }
 
@@ -1279,8 +1279,8 @@ impl Application {
 
         // choose the scroll so that the same canvas point stays under the anchor
         let (content_w, content_h) = self.content_size(new_zoom);
-        self.scroll.0 = (content_w - self.bitmap.width as f32 * new_zoom) / 2. - (anchor.0 - cx * new_zoom);
-        self.scroll.1 = (content_h - self.bitmap.height as f32 * new_zoom) / 2. - (anchor.1 - cy * new_zoom);
+        self.scroll.0 = (content_w - self.pixmap.width as f32 * new_zoom) / 2. - (anchor.0 - cx * new_zoom);
+        self.scroll.1 = (content_h - self.pixmap.height as f32 * new_zoom) / 2. - (anchor.1 - cy * new_zoom);
         self.clamp_scroll();
         self.mark_dirty();
     }
@@ -1289,7 +1289,7 @@ impl Application {
     fn fit_to_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let avail_w = f32::from(self.viewport_size.width) - CANVAS_MARGIN * 2.;
         let avail_h = f32::from(self.viewport_size.height) - CANVAS_MARGIN * 2.;
-        let zoom = (avail_w / self.bitmap.width as f32).min(avail_h / self.bitmap.height as f32);
+        let zoom = (avail_w / self.pixmap.width as f32).min(avail_h / self.pixmap.height as f32);
         // round down to a whole percent so that the canvas is never cut off
         let percent = (zoom * 100.).floor().clamp(MIN_ZOOM_PERCENT, MAX_ZOOM_PERCENT);
         self.apply_zoom(percent);
@@ -1307,7 +1307,7 @@ impl Application {
         cx.notify();
     }
 
-    // convert a window position into canvas pixel coordinates (maybe outside the bitmap)
+    // convert a window position into canvas pixel coordinates (maybe outside the pixel map)
     fn to_canvas_px(&self, pos: Point<Pixels>) -> (i32, i32) {
         let origin = self.viewport_origin.get();
         let (ox, oy) = self.canvas_origin();
@@ -1319,7 +1319,7 @@ impl Application {
 
     // -- view rendering ------------------------------------------------------
 
-    // build the visible part of the bitmap, magnified with nearest-neighbor sampling
+    // build the visible part of the pixel map, magnified with nearest-neighbor sampling
     fn rebuild_view_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let scale = window.scale_factor();
         let w = (f32::from(self.viewport_size.width) * scale).ceil().max(1.) as usize;
@@ -1330,8 +1330,8 @@ impl Application {
         let (ox, oy) = self.canvas_origin();
         let (ox, oy) = (ox * scale, oy * scale);
 
-        let bw = self.bitmap.width as i32;
-        let bh = self.bitmap.height as i32;
+        let bw = self.pixmap.width as i32;
+        let bh = self.pixmap.height as i32;
 
         self.xs_cache.clear();
         self.xs_cache.reserve(w);
@@ -1347,7 +1347,7 @@ impl Application {
             self.ys_cache.push(if c < 0 || c >= bh { -1 } else { c });
         }
 
-        // lifted selection pixels are drawn on top of the bitmap
+        // lifted selection pixels are drawn on top of the pixel map
         let floating = self
             .selection
             .as_ref()
@@ -1376,7 +1376,7 @@ impl Application {
                     {
                         f.pixels[(cry - sy) as usize * f.width + (crx - sx) as usize]
                     }
-                    _ => self.bitmap.pixels[cry as usize * self.bitmap.width + crx as usize],
+                    _ => self.pixmap.pixels[cry as usize * self.pixmap.width + crx as usize],
                 };
                 let mut c = [p[0], p[1], p[2]];
                 // first device column of a canvas pixel column
@@ -1456,10 +1456,10 @@ impl Application {
 
     // turn the pixels modified since the last entry into one undo step
     fn record_history(&mut self) {
-        let Some((x0, y0, x1, y1)) = self.bitmap.dirty.take() else { return };
+        let Some((x0, y0, x1, y1)) = self.pixmap.dirty.take() else { return };
         let (x, y, w, h) = (x0 as usize, y0 as usize, (x1 - x0) as usize, (y1 - y0) as usize);
         let before = self.committed.read_region(x, y, w, h);
-        let after = self.bitmap.read_region(x, y, w, h);
+        let after = self.pixmap.read_region(x, y, w, h);
         if before == after {
             return; // nothing actually changed
         }
@@ -1471,16 +1471,16 @@ impl Application {
         match edit {
             Edit::Patch { x, y, w, h, before, after } => {
                 let data = if undo { before } else { after };
-                self.bitmap.write_region(*x, *y, *w, *h, data);
+                self.pixmap.write_region(*x, *y, *w, *h, data);
                 self.committed.write_region(*x, *y, *w, *h, data);
             }
             Edit::Replace { before, after } => {
                 let target = if undo { before } else { after };
-                self.bitmap = target.clone();
+                self.pixmap = target.clone();
                 self.committed = target.clone();
             }
         }
-        self.bitmap.dirty = None;
+        self.pixmap.dirty = None;
     }
 
     fn after_history_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1509,30 +1509,30 @@ impl Application {
         }
     }
 
-    // replace the whole bitmap (resize / open); `record` makes it undoable
-    fn replace_bitmap(&mut self, new_bitmap: Pixmap, record: bool) {
+    // replace the whole pixel map (resize / open); `record` makes it undoable
+    fn replace_pixmap(&mut self, new_pixmap: Pixmap, record: bool) {
         self.selection = None;
         self.drag = Drag::None;
         if record {
             self.record_history();
-            let before = std::mem::replace(&mut self.committed, new_bitmap.clone());
-            self.push_edit(Edit::Replace { before, after: new_bitmap.clone() });
+            let before = std::mem::replace(&mut self.committed, new_pixmap.clone());
+            self.push_edit(Edit::Replace { before, after: new_pixmap.clone() });
         } else {
-            self.committed = new_bitmap.clone();
+            self.committed = new_pixmap.clone();
             self.undo_stack.clear();
             self.redo_stack.clear();
             self.saved_depth = Some(0);
         }
-        self.bitmap = new_bitmap;
+        self.pixmap = new_pixmap;
     }
 
     // -- selection -----------------------------------------------------------
 
-    // flatten the selection into the bitmap (a no-op if the pixels were never lifted)
+    // flatten the selection into the pixel map (a no-op if the pixels were never lifted)
     fn commit_selection(&mut self) {
         let Some(sel) = self.selection.take() else { return };
         if let Some(floating) = sel.floating {
-            self.bitmap.paste(&floating, sel.x, sel.y);
+            self.pixmap.paste(&floating, sel.x, sel.y);
             self.record_history();
         }
         self.mark_dirty();
@@ -1550,8 +1550,8 @@ impl Application {
         self.selection = Some(Selection {
             x: 0,
             y: 0,
-            w: self.bitmap.width as i32,
-            h: self.bitmap.height as i32,
+            w: self.pixmap.width as i32,
+            h: self.pixmap.height as i32,
             floating: None,
         });
         self.mark_dirty();
@@ -1562,7 +1562,7 @@ impl Application {
         let Some(sel) = self.selection.take() else { return };
         // lifted pixels already left a hole behind, so only an unlifted selection needs clearing
         if sel.floating.is_none() {
-            self.bitmap.fill_rect(sel.x, sel.y, sel.w, sel.h, BACKGROUND);
+            self.pixmap.fill_rect(sel.x, sel.y, sel.w, sel.h, BACKGROUND);
         }
         self.record_history();
         self.mark_dirty();
@@ -1581,8 +1581,8 @@ impl Application {
     }
 
     fn update_selection(&mut self, start: (i32, i32), end: (i32, i32)) {
-        let max_x = self.bitmap.width as i32 - 1;
-        let max_y = self.bitmap.height as i32 - 1;
+        let max_x = self.pixmap.width as i32 - 1;
+        let max_y = self.pixmap.height as i32 - 1;
         let clamp = |p: (i32, i32)| (p.0.clamp(0, max_x), p.1.clamp(0, max_y));
         let (s, e) = (clamp(start), clamp(end));
         self.selection = Some(Selection {
@@ -1597,10 +1597,10 @@ impl Application {
     // copy the selection to the system clipboard as an image
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
         let Some(sel) = &self.selection else { return };
-        // lifted pixels live in the selection, otherwise read them from the bitmap
+        // lifted pixels live in the selection, otherwise read them from the pixel map
         let region = match &sel.floating {
             Some(floating) => floating.clone(),
-            None => self.bitmap.copy_region(sel.x, sel.y, sel.w, sel.h),
+            None => self.pixmap.copy_region(sel.x, sel.y, sel.w, sel.h),
         };
         let bytes: Vec<u8> = region.pixels.iter().flatten().copied().collect();
         let Some(buffer) = image::RgbaImage::from_raw(region.width as u32, region.height as u32, bytes) else {
@@ -1629,7 +1629,7 @@ impl Application {
 
     // read an image from the clipboard; Ok(None) means there is no image to paste
     fn read_clipboard_image(cx: &mut Context<Self>) -> Result<Option<image::RgbaImage>, String> {
-        // Windows: read the native bitmap formats first (CF_DIBV5 / CF_DIB / "PNG")
+        // Windows: read the native pixel map formats first (CF_DIBV5 / CF_DIB / "PNG")
         #[cfg(windows)]
         {
             if let Some(img) = win_clipboard::read_image() {
@@ -1673,12 +1673,12 @@ impl Application {
         self.commit_selection();
 
         // grow the canvas when the image does not fit (undoable)
-        if w > self.bitmap.width || h > self.bitmap.height {
-            let (old_w, old_h) = (self.bitmap.width, self.bitmap.height);
+        if w > self.pixmap.width || h > self.pixmap.height {
+            let (old_w, old_h) = (self.pixmap.width, self.pixmap.height);
             let mut grown = Pixmap::new(w.max(old_w), h.max(old_h), BACKGROUND);
-            let data = self.bitmap.read_region(0, 0, old_w, old_h);
+            let data = self.pixmap.read_region(0, 0, old_w, old_h);
             grown.write_region(0, 0, old_w, old_h, &data);
-            self.replace_bitmap(grown, true);
+            self.replace_pixmap(grown, true);
             self.sync_size_inputs(window, cx);
         }
 
@@ -1692,7 +1692,7 @@ impl Application {
         let view_h = f32::from(self.viewport_size.height) - if bar_x.is_some() { SCROLLBAR_SIZE } else { 0. };
         let (ox, oy) = self.canvas_origin();
         let zoom = self.zoom();
-        let (bw, bh) = (self.bitmap.width as i32, self.bitmap.height as i32);
+        let (bw, bh) = (self.pixmap.width as i32, self.pixmap.height as i32);
         let vx0 = ((-ox / zoom).ceil() as i32).clamp(0, bw);
         let vy0 = ((-oy / zoom).ceil() as i32).clamp(0, bh);
         let vx1 = (((view_w - ox) / zoom).floor() as i32).clamp(vx0, bw);
@@ -1720,8 +1720,8 @@ impl Application {
             let sel = self.selection.as_mut().unwrap();
             // lift the pixels, leaving a background-colored hole
             if sel.floating.is_none() {
-                sel.floating = Some(self.bitmap.copy_region(sel.x, sel.y, sel.w, sel.h));
-                self.bitmap.fill_rect(sel.x, sel.y, sel.w, sel.h, BACKGROUND);
+                sel.floating = Some(self.pixmap.copy_region(sel.x, sel.y, sel.w, sel.h));
+                self.pixmap.fill_rect(sel.x, sel.y, sel.w, sel.h, BACKGROUND);
             }
             self.drag = Drag::SelectMove { grab: (p.0 - sel.x, p.1 - sel.y) };
         } else {
@@ -1745,7 +1745,7 @@ impl Application {
         let Some(backup) = self.shape_backup.as_ref() else { return };
         // erase the previous preview
         if let Some(bounds) = self.shape_bounds {
-            self.bitmap.restore_region(backup, bounds);
+            self.pixmap.restore_region(backup, bounds);
             if self.active_aa {
                 self.coverage.clear_rect(bounds);
             }
@@ -1763,7 +1763,7 @@ impl Application {
                 Tool::Line => Some(cov.add_capsule(pixel_center(start), pixel_center(end), r)),
                 // a filled rectangle is pixel-aligned, so it needs no smoothing
                 Tool::Rectangle if self.shape_filled => {
-                    self.bitmap.rect(x0, y0, x1, y1, size, true, color);
+                    self.pixmap.rect(x0, y0, x1, y1, size, true, color);
                     None
                 }
                 Tool::Rectangle => {
@@ -1793,13 +1793,13 @@ impl Application {
                 _ => None,
             };
             if let Some(rect) = touched {
-                self.bitmap.composite(backup, cov, color, rect);
+                self.pixmap.composite(backup, cov, color, rect);
             }
         } else {
             match self.tool {
-                Tool::Line => self.bitmap.line(start, end, size, color),
-                Tool::Rectangle => self.bitmap.rect(x0, y0, x1, y1, size, self.shape_filled, color),
-                Tool::Oval => self.bitmap.ellipse(x0, y0, x1, y1, size, self.shape_filled, color),
+                Tool::Line => self.pixmap.line(start, end, size, color),
+                Tool::Rectangle => self.pixmap.rect(x0, y0, x1, y1, size, self.shape_filled, color),
+                Tool::Oval => self.pixmap.ellipse(x0, y0, x1, y1, size, self.shape_filled, color),
                 _ => {}
             }
         }
@@ -1907,8 +1907,8 @@ impl Application {
         let cosmic_color = cosmic_text::Color::rgba(color[0], color[1], color[2], 0xff);
 
         let antialias = self.antialias;
-        let bw = self.bitmap.width as i32;
-        let bh = self.bitmap.height as i32;
+        let bw = self.pixmap.width as i32;
+        let bh = self.pixmap.height as i32;
 
         let mut drawn = false;
         buffer.draw(swash_cache, cosmic_color, |x, y, _w, _h, pixel_color| {
@@ -1924,18 +1924,18 @@ impl Application {
             let glyph_rgb = [pixel_color.r(), pixel_color.g(), pixel_color.b()];
             if !antialias {
                 if a >= 128 {
-                    self.bitmap.set(px, py, [glyph_rgb[0], glyph_rgb[1], glyph_rgb[2], 0xff]);
+                    self.pixmap.set(px, py, [glyph_rgb[0], glyph_rgb[1], glyph_rgb[2], 0xff]);
                     drawn = true;
                 }
             } else if a == 255 {
-                self.bitmap.set(px, py, [glyph_rgb[0], glyph_rgb[1], glyph_rgb[2], 0xff]);
+                self.pixmap.set(px, py, [glyph_rgb[0], glyph_rgb[1], glyph_rgb[2], 0xff]);
                 drawn = true;
-            } else if let Some(bg) = self.bitmap.get(px, py) {
+            } else if let Some(bg) = self.pixmap.get(px, py) {
                 let alpha = a as u32;
                 let blend = |fg: u8, bg: u8| -> u8 {
                     ((fg as u32 * alpha + bg as u32 * (255 - alpha) + 127) / 255) as u8
                 };
-                self.bitmap.set(
+                self.pixmap.set(
                     px,
                     py,
                     [
@@ -1963,13 +1963,13 @@ impl Application {
         };
         let radius = self.brush_size as f32 / 2.;
         let rect = self.coverage.add_capsule(pixel_center(from), pixel_center(to), radius);
-        self.bitmap.composite(backup, &self.coverage, color, rect);
+        self.pixmap.composite(backup, &self.coverage, color, rect);
     }
 
     // -- canvas size ---------------------------------------------------------
 
     fn sync_size_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (width, height) = (self.bitmap.width, self.bitmap.height);
+        let (width, height) = (self.pixmap.width, self.pixmap.height);
         self.set_size_inputs(width, height, window, cx);
     }
 
@@ -1997,7 +1997,7 @@ impl Application {
         // it is read before the selection is flattened, and only after validation succeeded,
         // so that a rejected input leaves the selection intact for the next try
         let (ox, oy) = self.selection.as_ref().map_or((0, 0), |s| (s.x, s.y));
-        if (ox, oy) == (0, 0) && width == self.bitmap.width && height == self.bitmap.height {
+        if (ox, oy) == (0, 0) && width == self.pixmap.width && height == self.pixmap.height {
             return false;
         }
 
@@ -2005,9 +2005,9 @@ impl Application {
         self.commit_selection();
 
         // trim at (ox, oy); the part outside the current canvas becomes the background
-        let new_bitmap = self.bitmap.copy_region(ox, oy, width as i32, height as i32);
+        let new_pixmap = self.pixmap.copy_region(ox, oy, width as i32, height as i32);
 
-        self.replace_bitmap(new_bitmap, true);
+        self.replace_pixmap(new_pixmap, true);
         self.after_history_change(window, cx);
         true
     }
@@ -2108,22 +2108,22 @@ impl Application {
                 let color = self.tool_color();
                 if self.antialias {
                     // keep the pixels from before the stroke; the stroke is composited over them
-                    self.shape_backup = Some(self.bitmap.clone());
-                    self.coverage.prepare(self.bitmap.width, self.bitmap.height);
+                    self.shape_backup = Some(self.pixmap.clone());
+                    self.coverage.prepare(self.pixmap.width, self.pixmap.height);
                     self.active_aa = true;
                     self.aa_segment(p, p, color);
                 } else {
                     self.active_aa = false;
-                    self.bitmap.stamp(p.0, p.1, self.brush_size, color);
+                    self.pixmap.stamp(p.0, p.1, self.brush_size, color);
                 }
             }
             Tool::Fill => {
                 let color = self.current_color;
-                self.bitmap.flood_fill(p.0, p.1, color, self.antialias);
+                self.pixmap.flood_fill(p.0, p.1, color, self.antialias);
                 self.record_history();
             }
             Tool::Picker => {
-                if let Some(c) = self.bitmap.get(p.0, p.1) {
+                if let Some(c) = self.pixmap.get(p.0, p.1) {
                     self.current_color = c;
                     let hsla = rgba_to_hsla(c);
                     // keep the picker's displayed color in sync (does not emit Change)
@@ -2136,16 +2136,16 @@ impl Application {
             Tool::Line | Tool::Rectangle | Tool::Oval => {
                 self.drag = Drag::Shape { start: p };
                 self.last_pos = p;
-                self.shape_backup = Some(self.bitmap.clone());
+                self.shape_backup = Some(self.pixmap.clone());
                 self.active_aa = self.antialias;
                 if self.active_aa {
-                    self.coverage.prepare(self.bitmap.width, self.bitmap.height);
+                    self.coverage.prepare(self.pixmap.width, self.pixmap.height);
                 }
                 self.shape_bounds = None;
                 self.draw_shape(p, p);
             }
             Tool::Text => {
-                if self.bitmap.get(p.0, p.1).is_some() {
+                if self.pixmap.get(p.0, p.1).is_some() {
                     self.draw_text(p, window, cx);
                 }
             }
@@ -2162,7 +2162,7 @@ impl Application {
         let p = self.to_canvas_px(event.position);
 
         // cursor position shown in the footer
-        let inside = p.0 >= 0 && p.1 >= 0 && p.0 < self.bitmap.width as i32 && p.1 < self.bitmap.height as i32;
+        let inside = p.0 >= 0 && p.1 >= 0 && p.0 < self.pixmap.width as i32 && p.1 < self.pixmap.height as i32;
         let cursor = inside.then_some(p);
         let mut changed = false;
         if cursor != self.cursor_px {
@@ -2183,7 +2183,7 @@ impl Application {
                     if self.active_aa {
                         self.aa_segment(self.last_pos, p, color);
                     } else {
-                        self.bitmap.line(self.last_pos, p, self.brush_size, color);
+                        self.pixmap.line(self.last_pos, p, self.brush_size, color);
                     }
                     self.last_pos = p;
                     self.mark_dirty();
@@ -2409,9 +2409,9 @@ impl Application {
             rfd::MessageDialogResult::Yes => {
                 let existing = self.file_path.clone().filter(|p| save_format(p).is_some());
                 if let Some(path) = existing {
-                    let bitmap = self.bitmap.clone();
+                    let pixmap = self.pixmap.clone();
                     let depth = self.undo_stack.len();
-                    self.write_image_data(&bitmap, depth, path, cx)
+                    self.write_image_data(&pixmap, depth, path, cx)
                 } else {
                     self.save_image_on_close(cx);
                     false
@@ -2424,7 +2424,7 @@ impl Application {
 
     fn save_image_on_close(&mut self, cx: &mut Context<Self>) {
         let dialog = self.prepare_save_dialog();
-        let current_bitmap = self.bitmap.clone();
+        let current_pixmap = self.pixmap.clone();
         let current_depth = self.undo_stack.len();
         self.is_saving = true;
 
@@ -2439,7 +2439,7 @@ impl Application {
                 if path.extension().is_none() {
                     path = path.with_extension("png");
                 }
-                if this.write_image_data(&current_bitmap, current_depth, path, cx) {
+                if this.write_image_data(&current_pixmap, current_depth, path, cx) {
                     cx.quit();
                 }
             })
@@ -2483,8 +2483,8 @@ impl Application {
     ) {
         match action {
             DiscardAction::NewDocument => {
-                let bitmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
-                self.replace_bitmap(bitmap, false);
+                let pixmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
+                self.replace_pixmap(pixmap, false);
                 self.file_path = None;
                 self.scroll = (0., 0.);
                 self.after_history_change(window, cx);
@@ -2497,8 +2497,8 @@ impl Application {
                         return;
                     }
                 };
-                let bitmap = Pixmap::from(img);
-                self.replace_bitmap(bitmap, false);
+                let pixmap = Pixmap::from(img);
+                self.replace_pixmap(pixmap, false);
                 self.file_path = Some(path);
                 self.scroll = (0., 0.);
                 self.after_history_change(window, cx);
@@ -2551,9 +2551,9 @@ impl Application {
 
         let existing = self.file_path.clone().filter(|p| !save_as && save_format(p).is_some());
         if let Some(path) = existing {
-            let bitmap = self.bitmap.clone();
+            let pixmap = self.pixmap.clone();
             let depth = self.undo_stack.len();
-            if self.write_image_data(&bitmap, depth, path, cx) {
+            if self.write_image_data(&pixmap, depth, path, cx) {
                 if let Some(action) = continuation {
                     self.perform_discard_action(action, window, cx);
                 }
@@ -2562,7 +2562,7 @@ impl Application {
         }
 
         let dialog = self.prepare_save_dialog();
-        let current_bitmap = self.bitmap.clone();
+        let current_pixmap = self.pixmap.clone();
         let current_depth = self.undo_stack.len();
         self.is_saving = true;
 
@@ -2577,7 +2577,7 @@ impl Application {
                 if path.extension().is_none() {
                     path = path.with_extension("png");
                 }
-                if this.write_image_data(&current_bitmap, current_depth, path, cx) {
+                if this.write_image_data(&current_pixmap, current_depth, path, cx) {
                     if let Some(action) = continuation {
                         this.perform_discard_action(action, window, cx);
                     }
@@ -2590,7 +2590,7 @@ impl Application {
 
     fn write_image_data(
         &mut self,
-        bitmap: &Pixmap,
+        pixmap: &Pixmap,
         saved_depth: usize,
         path: PathBuf,
         cx: &mut Context<Self>,
@@ -2600,8 +2600,8 @@ impl Application {
             return false;
         };
 
-        let data: Vec<u8> = bitmap.pixels.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
-        let Some(img) = image::RgbImage::from_raw(bitmap.width as u32, bitmap.height as u32, data) else {
+        let data: Vec<u8> = pixmap.pixels.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let Some(img) = image::RgbImage::from_raw(pixmap.width as u32, pixmap.height as u32, data) else {
             show_error("Failed to build the image.");
             return false;
         };
@@ -2828,7 +2828,7 @@ impl Application {
             .unwrap_or_else(|| "Untitled".to_string());
         let file_text = if self.is_modified() { format!("*{base_name}") } else { base_name };
 
-        let size_text = format!("{} × {} px", self.bitmap.width, self.bitmap.height);
+        let size_text = format!("{} × {} px", self.pixmap.width, self.pixmap.height);
         let cursor_text = self
             .cursor_px
             .map(|(x, y)| format!("{}, {}", x, y))
