@@ -56,6 +56,11 @@ const DEFAULT_CANVAS_SIZE: (usize, usize) = (600, 500);
 const MAX_CANVAS_SIZE: usize = 4096;
 const MAX_HISTORY: usize = 100;
 
+// arrow proportions, as multiples of the brush size
+const ARROW_HEAD_LEN: f32 = 5.;
+const ARROW_HEAD_HALF: f32 = 2.5; // half width of the head
+const ARROW_TAIL_HALF: f32 = 1.;  // half width of the body where it is widest
+
 // mosaic cell size = brush size * this factor (so the brush size select controls the coarseness)
 const MOSAIC_BLOCK_FACTOR: i32 = 2;
 
@@ -71,6 +76,83 @@ type Rect = (i32, i32, i32, i32); // x0, y0, x1, y1 (end-exclusive)
 
 fn union_rect(a: Rect, b: Rect) -> Rect {
     (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
+/// center of a canvas pixel in continuous coordinates
+fn pixel_center(p: (i32, i32)) -> (f32, f32) {
+    (p.0 as f32 + 0.5, p.1 as f32 + 0.5)
+}
+
+type Pt = (f32, f32);
+
+/// Signed distance from `p` to a triangle (negative inside).
+/// Returns `f32::MAX` for a degenerate triangle, so that nothing is covered.
+fn triangle_distance(tri: &[Pt; 3], p: Pt) -> f32 {
+    let area = (tri[1].0 - tri[0].0) * (tri[2].1 - tri[0].1)
+        - (tri[1].1 - tri[0].1) * (tri[2].0 - tri[0].0);
+    if area.abs() < 1e-6 {
+        return f32::MAX;
+    }
+    let sign = if area > 0. { 1. } else { -1. };
+    let mut d = f32::MIN;
+    for i in 0..3 {
+        let (a, b) = (tri[i], tri[(i + 1) % 3]);
+        let (ex, ey) = (b.0 - a.0, b.1 - a.1);
+        let len = (ex * ex + ey * ey).sqrt();
+        if len < 1e-6 {
+            continue;
+        }
+        // outward unit normal of the edge
+        let (nx, ny) = (ey * sign / len, -ex * sign / len);
+        d = d.max((p.0 - a.0) * nx + (p.1 - a.1) * ny);
+    }
+    d
+}
+
+/// Bounding box of a triangle: (min_x, min_y, max_x, max_y).
+fn triangle_bounds(tri: &[Pt; 3]) -> (f32, f32, f32, f32) {
+    let xs = tri.map(|p| p.0);
+    let ys = tri.map(|p| p.1);
+    (
+        xs.iter().cloned().fold(f32::MAX, f32::min),
+        ys.iter().cloned().fold(f32::MAX, f32::min),
+        xs.iter().cloned().fold(f32::MIN, f32::max),
+        ys.iter().cloned().fold(f32::MIN, f32::max),
+    )
+}
+
+/// An arrow from `start` to `end` as two triangles: a body that tapers to a point at the
+/// start, and the head at the end. Returns `None` when the arrow has no length.
+fn arrow_triangles(start: Pt, end: Pt, size: f32) -> Option<[[Pt; 3]; 2]> {
+    let (dx, dy) = (end.0 - start.0, end.1 - start.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1. {
+        return None;
+    }
+    let (ux, uy) = (dx / len, dy / len); // direction
+    let (nx, ny) = (-uy, ux); // normal
+
+    // shrink the whole arrow head and body when the drag is short, keeping the proportions
+    let k = (len * 0.5 / (size * ARROW_HEAD_LEN)).min(1.);
+    let head_len = size * ARROW_HEAD_LEN * k;
+    let head_half = size * ARROW_HEAD_HALF * k;
+    let tail_half = size * ARROW_TAIL_HALF * k;
+
+    // base of the head
+    let hb = (end.0 - ux * head_len, end.1 - uy * head_len);
+    let head = [
+        end,
+        (hb.0 + nx * head_half, hb.1 + ny * head_half),
+        (hb.0 - nx * head_half, hb.1 - ny * head_half),
+    ];
+    // the body ends inside the head, so that no seam shows between the two
+    let tb = (end.0 - ux * head_len * 0.8, end.1 - uy * head_len * 0.8);
+    let tail = [
+        start,
+        (tb.0 + nx * tail_half, tb.1 + ny * tail_half),
+        (tb.0 - nx * tail_half, tb.1 - ny * tail_half),
+    ];
+    Some([tail, head])
 }
 
 /// straight RGBA -> premultiplied (all channels in 0..=255 as f32)
@@ -112,11 +194,6 @@ fn over(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
     let (s, d) = (premul(src), premul(dst));
     let k = 1. - src[3] as f32 / 255.;
     unpremul(std::array::from_fn(|i| s[i] + d[i] * k))
-}
-
-/// center of a canvas pixel in continuous coordinates
-fn pixel_center(p: (i32, i32)) -> (f32, f32) {
-    (p.0 as f32 + 0.5, p.1 as f32 + 0.5)
 }
 
 /// Antialiasing coverage of the current stroke or shape (0..=255 per pixel).
@@ -252,6 +329,20 @@ impl Coverage {
                 let grad = 2. * (gx * gx + gy * gy).sqrt();
                 // signed distance (negative inside)
                 let d = if grad > 1e-6 { (f - 1.) / grad } else { -1.0e3 };
+                self.put(x, y, 0.5 - d);
+            }
+        }
+        self.mark_dirty(rect);
+        rect
+    }
+
+    /// Filled triangle with an antialiased edge.
+    fn add_triangle(&mut self, tri: &[Pt; 3]) -> Rect {
+        let (min_x, min_y, max_x, max_y) = triangle_bounds(tri);
+        let rect = self.clip(min_x - 1., min_y - 1., max_x + 1., max_y + 1.);
+        for y in rect.1..rect.3 {
+            for x in rect.0..rect.2 {
+                let d = triangle_distance(tri, (x as f32 + 0.5, y as f32 + 0.5));
                 self.put(x, y, 0.5 - d);
             }
         }
@@ -398,6 +489,32 @@ impl Pixmap {
                 _ => {}
             }
             prev = Some(p);
+        }
+    }
+
+    /// Fill a triangle (pixels whose center is inside), clipped to the pixel map.
+    fn fill_triangle(&mut self, tri: &[Pt; 3], color: [u8; 4]) {
+        let (min_x, min_y, max_x, max_y) = triangle_bounds(tri);
+        let x0 = (min_x.floor() as i32).max(0);
+        let y0 = (min_y.floor() as i32).max(0);
+        let x1 = (max_x.ceil() as i32).min(self.width as i32);
+        let y1 = (max_y.ceil() as i32).min(self.height as i32);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if triangle_distance(tri, (x as f32 + 0.5, y as f32 + 0.5)) <= 0. {
+                    self.set(x, y, color);
+                }
+            }
+        }
+    }
+
+    /// Arrow from `start` to `end` (see `arrow_triangles`), without antialiasing.
+    fn arrow(&mut self, start: (i32, i32), end: (i32, i32), size: i32, color: [u8; 4]) {
+        let Some(tris) = arrow_triangles(pixel_center(start), pixel_center(end), size as f32) else {
+            return;
+        };
+        for tri in &tris {
+            self.fill_triangle(tri, color);
         }
     }
 
@@ -736,6 +853,7 @@ enum Tool {
     Rectangle,
     Oval,
     Text,
+    Arrow,
     Mosaic,
     Select,
 }
@@ -1657,6 +1775,13 @@ impl Application {
                         Some(cov.add_ellipse_outline(cx, cy, a, b, r))
                     }
                 }
+                Tool::Arrow => {
+                    arrow_triangles(pixel_center(start), pixel_center(end), size as f32).map(|[tail, head]| {
+                        let r1 = cov.add_triangle(&tail);
+                        let r2 = cov.add_triangle(&head);
+                        union_rect(r1, r2)
+                    })
+                }
                 _ => None,
             };
             if let Some(rect) = touched {
@@ -1667,11 +1792,14 @@ impl Application {
                 Tool::Line => self.pixmap.line(start, end, size, color),
                 Tool::Rectangle => self.pixmap.rect(x0, y0, x1, y1, size, self.shape_filled, color),
                 Tool::Oval => self.pixmap.ellipse(x0, y0, x1, y1, size, self.shape_filled, color),
+                Tool::Arrow => self.pixmap.arrow(start, end, size, color),
                 _ => {}
             }
         }
         // the preview may extend beyond the corners by the brush size
-        self.shape_bounds = Some((x0 - size, y0 - size, x1 + size + 1, y1 + size + 1));
+        // (an arrow head is wider than the brush)
+        let margin = if self.tool == Tool::Arrow { size * 3 + 2 } else { size };
+        self.shape_bounds = Some((x0 - margin, y0 - margin, x1 + margin + 1, y1 + margin + 1));
     }
 
     fn draw_text(&mut self, origin: (i32, i32), window: &mut Window, cx: &mut Context<Self>) {
@@ -1983,7 +2111,7 @@ impl Application {
                     self.tool = Tool::Pencil;
                 }
             }
-            Tool::Line | Tool::Rectangle | Tool::Oval => {
+            Tool::Line | Tool::Rectangle | Tool::Oval | Tool::Arrow => {
                 self.drag = Drag::Shape { start: p };
                 self.last_pos = p;
                 self.shape_backup = Some(self.pixmap.clone());
@@ -2619,6 +2747,7 @@ impl Application {
             .child(self.tool_button("Rect", IconName::Square, Tool::Rectangle, cx))
             .child(self.tool_button("Oval", IconName::Ellipse, Tool::Oval, cx))
             .child(self.tool_button("Text", IconName::Type, Tool::Text, cx))
+            .child(self.tool_button("Arrow", IconName::MoveDownRight, Tool::Arrow, cx))
             .child(self.tool_button("Mosaic", IconName::LensConvex, Tool::Mosaic, cx))
             .child(self.tool_button("Select", IconName::SquareDashedMousePointer, Tool::Select, cx))
             .child(Button::new("btn-resize")
