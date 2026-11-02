@@ -56,6 +56,9 @@ const DEFAULT_CANVAS_SIZE: (usize, usize) = (600, 500);
 const MAX_CANVAS_SIZE: usize = 4096;
 const MAX_HISTORY: usize = 100;
 
+// mosaic cell size = brush size * this factor (so the brush size select controls the coarseness)
+const MOSAIC_BLOCK_FACTOR: i32 = 2;
+
 // transparent canvas background
 const BACKGROUND: [u8; 4] = [0, 0, 0, 0];
 const BACKGROUND_WHITE: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
@@ -548,6 +551,52 @@ impl Pixmap {
         Some(unpremul(std::array::from_fn(|k| pc[k] + (1. - a) * (col[k] - t[k]))))
     }
 
+    /// Pixelate a rectangle: every `block`-sized cell is replaced by its average color.
+    /// Cells are anchored at the top-left of the rectangle, and the averaging is done in
+    /// premultiplied space so that transparent pixels do not darken the result.
+    fn mosaic(&mut self, x: i32, y: i32, w: i32, h: i32, block: i32) {
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x + w).min(self.width as i32);
+        let y1 = (y + h).min(self.height as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let block = block.max(1);
+
+        let mut by = y0;
+        while by < y1 {
+            let by_end = (by + block).min(y1);
+            let mut bx = x0;
+            while bx < x1 {
+                let bx_end = (bx + block).min(x1);
+
+                // average of the cell
+                let mut sum = [0f32; 4];
+                for yy in by..by_end {
+                    let row = yy as usize * self.width;
+                    for xx in bx..bx_end {
+                        let p = premul(self.pixels[row + xx as usize]);
+                        for k in 0..4 {
+                            sum[k] += p[k];
+                        }
+                    }
+                }
+                let n = ((bx_end - bx) * (by_end - by)) as f32;
+                let avg = unpremul(sum.map(|v| v / n));
+
+                // fill the cell
+                for yy in by..by_end {
+                    let row = yy as usize * self.width;
+                    self.pixels[row + bx as usize..row + bx_end as usize].fill(avg);
+                }
+                bx = bx_end;
+            }
+            by = by_end;
+        }
+        self.mark(x0, y0, x1, y1);
+    }
+
     /// Copy a rectangle into a new pixel map (pixels outside of this pixel map become background).
     fn copy_region(&self, x: i32, y: i32, w: i32, h: i32) -> Pixmap {
         let mut out = Pixmap::new(w.max(1) as usize, h.max(1) as usize, BACKGROUND);
@@ -687,6 +736,7 @@ enum Tool {
     Rectangle,
     Oval,
     Text,
+    Mosaic,
     Select,
 }
 
@@ -698,6 +748,8 @@ enum Drag {
     Shape { start: (i32, i32) },
     SelectNew { start: (i32, i32) },
     SelectMove { grab: (i32, i32) },
+    // rectangle drag of the mosaic tool; the rectangle is shown through `selection`
+    MosaicNew { start: (i32, i32) },
     // `grab` is the offset (in logical pixels) between the pointer and the thumb start
     ScrollbarX { grab: f32 },
     ScrollbarY { grab: f32 },
@@ -1386,7 +1438,7 @@ impl Application {
 
     // Esc: drop the selection, keeping the moved pixels in place
     fn deselect(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.drag, Drag::SelectNew { .. } | Drag::SelectMove { .. }) {
+        if matches!(self.drag, Drag::SelectNew { .. } | Drag::SelectMove { .. } | Drag::MosaicNew { .. }) {
             self.drag = Drag::None;
         }
         self.commit_selection();
@@ -1947,6 +1999,11 @@ impl Application {
                     self.draw_text(p, window, cx);
                 }
             }
+            Tool::Mosaic => {
+                self.drag = Drag::MosaicNew { start: p };
+                // show the rectangle with the selection outline while dragging
+                self.update_selection(p, p);
+            }
             Tool::Select => self.select_mouse_down(p),
         }
         self.mark_dirty();
@@ -1968,7 +2025,8 @@ impl Application {
             changed = true;
         }
         // the pointer shape depends on whether the pointer is over the selection
-        let over = self.selection.as_ref().is_some_and(|s| s.contains(p));
+        // (only the Select tool can move it)
+        let over = self.tool == Tool::Select && self.selection.as_ref().is_some_and(|s| s.contains(p));
         if over != self.over_selection {
             self.over_selection = over;
             changed = true;
@@ -1995,6 +2053,11 @@ impl Application {
                     self.mark_dirty();
                     changed = true;
                 }
+            }
+            Drag::MosaicNew { start } => {
+                self.update_selection(start, p);
+                self.mark_dirty();
+                changed = true;
             }
             Drag::SelectNew { start } => {
                 self.update_selection(start, p);
@@ -2053,6 +2116,16 @@ impl Application {
                 self.active_aa = false;
                 self.record_history();
             }
+            Drag::MosaicNew { .. } => {
+                // apply the mosaic to the dragged rectangle; the rectangle is not kept as a selection
+                if let Some(sel) = self.selection.take() {
+                    if sel.w > 1 || sel.h > 1 {
+                        let block = self.brush_size * MOSAIC_BLOCK_FACTOR;
+                        self.pixmap.mosaic(sel.x, sel.y, sel.w, sel.h, block);
+                        self.record_history();
+                    }
+                }
+            }
             Drag::SelectNew { .. } => {
                 // a plain click (no drag) just clears the selection
                 if self.selection.as_ref().is_some_and(|s| s.w == 1 && s.h == 1) {
@@ -2064,7 +2137,8 @@ impl Application {
 
         // the selection may have just been created, moved or cleared
         let p = self.to_canvas_px(event.position);
-        self.over_selection = self.selection.as_ref().is_some_and(|s| s.contains(p));
+        self.over_selection = self.tool == Tool::Select
+            && self.selection.as_ref().is_some_and(|s| s.contains(p));
 
         self.mark_dirty();
         cx.notify();
@@ -2100,6 +2174,11 @@ impl Application {
                 self.coverage.clear_all();
                 self.active_aa = false;
                 self.record_history();
+            }
+            // cancel an unfinished mosaic drag without applying it
+            Drag::MosaicNew { .. } => {
+                self.selection = None;
+                self.mark_dirty();
             }
             _ => {}
         }
@@ -2540,6 +2619,7 @@ impl Application {
             .child(self.tool_button("Rect", IconName::Square, Tool::Rectangle, cx))
             .child(self.tool_button("Oval", IconName::Ellipse, Tool::Oval, cx))
             .child(self.tool_button("Text", IconName::Type, Tool::Text, cx))
+            .child(self.tool_button("Mosaic", IconName::LensConvex, Tool::Mosaic, cx))
             .child(self.tool_button("Select", IconName::SquareDashedMousePointer, Tool::Select, cx))
             .child(Button::new("btn-resize")
                 .small().icon(IconName::ImageUpscale).tooltip("Resize…").ghost()
