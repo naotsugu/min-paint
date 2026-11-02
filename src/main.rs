@@ -879,6 +879,13 @@ impl Application {
             this.update(cx, |app, cx| app.handle_window_close(cx)).unwrap_or(true)
         });
 
+        // Quit (menu / Cmd+Q): ask about unsaved changes the same way as closing the window.
+        // `Context::on_action` shadows `App::on_action`, so call the App one explicitly.
+        let weak = cx.entity().downgrade();
+        App::on_action(cx, move |_: &Quit, cx| {
+            weak.update(cx, |app, cx| app.request_quit(cx)).ok();
+        });
+
         let mut app = Self {
             committed: pixmap.clone(),
             pixmap,
@@ -2443,6 +2450,14 @@ impl Application {
         .detach();
     }
 
+    // quit after the same unsaved-changes check that closing the window uses;
+    // when a save dialog is needed, the quit happens after the file is written
+    fn request_quit(&mut self, cx: &mut Context<Self>) {
+        if self.handle_window_close(cx) {
+            cx.quit();
+        }
+    }
+
     // -- UI ------------------------------------------------------------------
 
     fn tool_button(&self, label: &'static str, icon: impl Into<Icon>, tool: Tool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2977,6 +2992,10 @@ fn main() {
     });
     app.run(move |cx| {
         init(cx);
+
+        #[cfg(target_os = "macos")]
+        set_app_menu(cx);
+
         let window_options = window_options(cx);
         open_window(window_options, cx, move |window, cx| {
             let open_rx = open_rx.borrow_mut().take();
@@ -2992,6 +3011,19 @@ fn main() {
 
         cx.activate(true);
     });
+}
+
+actions!(min_paint, [Quit]);
+
+/// Application menu shown in the macOS menu bar (Quit only, for now).
+#[cfg(target_os = "macos")]
+fn set_app_menu(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+    cx.set_menus(vec![Menu {
+        name: "min-paint".into(),
+        items: vec![MenuItem::action("Quit min-paint", Quit)],
+        disabled: false,
+    }]);
 }
 
 fn window_options(cx: &mut App) -> WindowOptions {
