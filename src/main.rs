@@ -56,12 +56,59 @@ const DEFAULT_CANVAS_SIZE: (usize, usize) = (600, 500);
 const MAX_CANVAS_SIZE: usize = 4096;
 const MAX_HISTORY: usize = 100;
 
-const BACKGROUND: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+// transparent canvas background
+const BACKGROUND: [u8; 4] = [0, 0, 0, 0];
+const BACKGROUND_WHITE: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+// checkerboard shown behind transparent pixels
+const CHECKER_CELL: f32 = 8.; // logical pixels
+const CHECKER_LIGHT: [u8; 3] = [0xff, 0xff, 0xff];
+const CHECKER_DARK: [u8; 3] = [0xcc, 0xcc, 0xcc];
 
 type Rect = (i32, i32, i32, i32); // x0, y0, x1, y1 (end-exclusive)
 
 fn union_rect(a: Rect, b: Rect) -> Rect {
     (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
+/// straight RGBA -> premultiplied (all channels in 0..=255 as f32)
+fn premul(p: [u8; 4]) -> [f32; 4] {
+    let a = p[3] as f32 / 255.;
+    [p[0] as f32 * a, p[1] as f32 * a, p[2] as f32 * a, p[3] as f32]
+}
+
+/// premultiplied -> straight RGBA; fully transparent pixels are always `[0, 0, 0, 0]`
+fn unpremul(p: [f32; 4]) -> [u8; 4] {
+    let a = p[3].clamp(0., 255.);
+    if a < 0.5 {
+        return [0, 0, 0, 0];
+    }
+    let k = 255. / a;
+    let q = |v: f32| (v * k).round().clamp(0., 255.) as u8;
+    [q(p[0]), q(p[1]), q(p[2]), a.round() as u8]
+}
+
+/// Interpolate from `from` to `to` by `c` (0..=255) in premultiplied space.
+/// With an opaque `to` this is "source over"; with a transparent `to` it erases.
+fn mix_px(from: [u8; 4], to: [u8; 4], c: u32) -> [u8; 4] {
+    if from[3] == 255 && to[3] == 255 {
+        let m = |f: u8, t: u8| ((f as u32 * (255 - c) + t as u32 * c + 127) / 255) as u8;
+        return [m(from[0], to[0]), m(from[1], to[1]), m(from[2], to[2]), 0xff];
+    }
+    let (f, t) = (premul(from), premul(to));
+    let k = c as f32 / 255.;
+    unpremul(std::array::from_fn(|i| f[i] + (t[i] - f[i]) * k))
+}
+
+/// Porter-Duff "source over" for straight RGBA pixels.
+fn over(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+    match src[3] {
+        255 => return src,
+        0 => return dst,
+        _ => {}
+    }
+    let (s, d) = (premul(src), premul(dst));
+    let k = 1. - src[3] as f32 / 255.;
+    unpremul(std::array::from_fn(|i| s[i] + d[i] * k))
 }
 
 /// center of a canvas pixel in continuous coordinates
@@ -227,17 +274,11 @@ impl Pixmap {
     }
     fn from(img: image::RgbaImage) -> Self {
         let (width, height) = (img.width() as usize, img.height() as usize);
-        // the canvas is opaque, so flatten transparency onto white
         let pixels = img.pixels()
-            .map(|p| {
-                let a = p[3] as u32;
-                let blend = |c: u8| ((c as u32 * a + 255 * (255 - a) + 127) / 255) as u8;
-                [blend(p[0]), blend(p[1]), blend(p[2]), 0xff]
-            })
+            .map(|p| if p[3] == 0 { [0, 0, 0, 0] } else { [p[0], p[1], p[2], p[3]] })
             .collect();
         Self { width, height, pixels, dirty: None }
     }
-
     // grow the dirty area; the given rectangle must already be clipped to the pixel map
     fn mark(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
         if x0 >= x1 || y0 >= y1 {
@@ -476,42 +517,35 @@ impl Pixmap {
         }
     }
 
-    /// New color of an antialiased pixel next to a filled region, or `None` to keep it.
-    /// The pixel is modeled as a mix of the old region color `target` and a line color;
-    /// only the `target` share of the mix is replaced by `color`.
     fn blend_edge(&self, x: i32, y: i32, target: [u8; 4], color: [u8; 4]) -> Option<[u8; 4]> {
         let c = self.get(x, y)?;
         if c == target {
             return None; // not connected to the region, so leave it alone
         }
-        let dist2 = |p: [u8; 4]| -> i32 {
-            (0..3).map(|k| (p[k] as i32 - target[k] as i32).pow(2)).sum()
-        };
+        // work in premultiplied space so that antialiased edges against a
+        // transparent background are handled correctly
+        let (t, col, pc) = (premul(target), premul(color), premul(c));
+        let dist2 = |p: [f32; 4]| -> f32 { (0..4).map(|k| (p[k] - t[k]).powi(2)).sum() };
         // the most distant color nearby stands in for the line color
-        let mut line = c;
+        let mut line = pc;
         for dy in -1..=1 {
             for dx in -1..=1 {
                 if let Some(n) = self.get(x + dx, y + dy) {
+                    let n = premul(n);
                     if dist2(n) > dist2(line) {
                         line = n;
                     }
                 }
             }
         }
-        let d: [f32; 3] = std::array::from_fn(|k| line[k] as f32 - target[k] as f32);
+        let d: [f32; 4] = std::array::from_fn(|k| line[k] - t[k]);
         let len2: f32 = d.iter().map(|v| v * v).sum();
-        // share of the line color in this pixel (1.0 = solid line)
-        let a = ((0..3)
-            .map(|k| (c[k] as f32 - target[k] as f32) * d[k])
-            .sum::<f32>()
-            / len2)
-            .clamp(0., 1.);
-        let mut out = c;
-        for k in 0..3 {
-            let v = c[k] as f32 + (1. - a) * (color[k] as f32 - target[k] as f32);
-            out[k] = v.round().clamp(0., 255.) as u8;
+        if len2 < 1e-6 {
+            return None;
         }
-        Some(out)
+        // share of the line color in this pixel (1.0 = solid line)
+        let a = ((0..4).map(|k| (pc[k] - t[k]) * d[k]).sum::<f32>() / len2).clamp(0., 1.);
+        Some(unpremul(std::array::from_fn(|k| pc[k] + (1. - a) * (col[k] - t[k]))))
     }
 
     /// Copy a rectangle into a new pixel map (pixels outside of this pixel map become background).
@@ -539,8 +573,8 @@ impl Pixmap {
                 if dx < 0 || dx >= self.width as i32 {
                     continue;
                 }
-                self.pixels[dy as usize * self.width + dx as usize] =
-                    src.pixels[sy as usize * src.width + sx as usize];
+                let i = dy as usize * self.width + dx as usize;
+                self.pixels[i] = over(src.pixels[sy as usize * src.width + sx as usize], self.pixels[i]);
             }
         }
         self.mark(
@@ -577,7 +611,6 @@ impl Pixmap {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
-        let mix = |from: u8, to: u8, c: u32| ((from as u32 * (255 - c) + to as u32 * c + 127) / 255) as u8;
         for y in y0..y1 {
             let row = y as usize * self.width;
             for x in x0..x1 {
@@ -587,7 +620,7 @@ impl Pixmap {
                 self.pixels[i] = match c {
                     0 => b,
                     255 => color,
-                    _ => [mix(b[0], color[0], c), mix(b[1], color[1], c), mix(b[2], color[2], c), 0xff],
+                    _ => mix_px(b, color, c),
                 };
             }
         }
@@ -828,7 +861,7 @@ impl Application {
             }
         });
 
-        let pixmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
+        let pixmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND_WHITE);
 
         // follow the OS appearance (light / dark): apply it now and whenever it changes
         Theme::sync_system_appearance(Some(window), cx);
@@ -1088,6 +1121,11 @@ impl Application {
         let (ox, oy) = self.canvas_origin();
         let (ox, oy) = (ox * scale, oy * scale);
 
+        // checkerboard parity per device column / row, anchored to the canvas origin
+        let cell = CHECKER_CELL * scale;
+        let col_par: Vec<i32> = (0..w).map(|i| ((i as f32 + 0.5 - ox) / cell).floor() as i32 & 1).collect();
+        let row_par: Vec<i32> = (0..h).map(|i| ((i as f32 + 0.5 - oy) / cell).floor() as i32 & 1).collect();
+
         let bw = self.pixmap.width as i32;
         let bh = self.pixmap.height as i32;
 
@@ -1128,15 +1166,27 @@ impl Application {
                     row[x * 4 + 3] = 0xff;
                     continue;
                 }
+
+                let base = self.pixmap.pixels[cry as usize * self.pixmap.width + crx as usize];
                 let p = match floating {
                     Some((sx, sy, f))
                     if crx >= sx && crx < sx + f.width as i32 && cry >= sy && cry < sy + f.height as i32 =>
-                    {
-                        f.pixels[(cry - sy) as usize * f.width + (crx - sx) as usize]
-                    }
-                    _ => self.pixmap.pixels[cry as usize * self.pixmap.width + crx as usize],
+                        {
+                            // the lifted selection is shown composited over the pixel map
+                            over(f.pixels[(cry - sy) as usize * f.width + (crx - sx) as usize], base)
+                        }
+                    _ => base,
                 };
                 let mut c = [p[0], p[1], p[2]];
+                if p[3] != 255 {
+                    // blend with the checkerboard behind transparent pixels
+                    let chk = if (col_par[x] ^ row_par[y]) == 0 { CHECKER_LIGHT } else { CHECKER_DARK };
+                    let a = p[3] as u32;
+                    for k in 0..3 {
+                        c[k] = ((c[k] as u32 * a + chk[k] as u32 * (255 - a) + 127) / 255) as u8;
+                    }
+                }
+
                 // first device column of a canvas pixel column
                 if grid && (on_h_line || x == 0 || self.xs_cache[x - 1] != crx) {
                     for v in &mut c {
@@ -1662,7 +1712,7 @@ impl Application {
         buffer.shape_until_scroll(false);
 
         let color = self.current_color;
-        let cosmic_color = cosmic_text::Color::rgba(color[0], color[1], color[2], 0xff);
+        let cosmic_color = cosmic_text::Color::rgba(color[0], color[1], color[2], color[3]);
 
         let antialias = self.antialias;
         let bw = self.pixmap.width as i32;
@@ -1679,30 +1729,14 @@ impl Application {
             if a == 0 {
                 return;
             }
-            let glyph_rgb = [pixel_color.r(), pixel_color.g(), pixel_color.b()];
+            let src = [pixel_color.r(), pixel_color.g(), pixel_color.b(), a];
             if !antialias {
                 if a >= 128 {
-                    self.pixmap.set(px, py, [glyph_rgb[0], glyph_rgb[1], glyph_rgb[2], 0xff]);
+                    self.pixmap.set(px, py, [src[0], src[1], src[2], color[3]]);
                     drawn = true;
                 }
-            } else if a == 255 {
-                self.pixmap.set(px, py, [glyph_rgb[0], glyph_rgb[1], glyph_rgb[2], 0xff]);
-                drawn = true;
             } else if let Some(bg) = self.pixmap.get(px, py) {
-                let alpha = a as u32;
-                let blend = |fg: u8, bg: u8| -> u8 {
-                    ((fg as u32 * alpha + bg as u32 * (255 - alpha) + 127) / 255) as u8
-                };
-                self.pixmap.set(
-                    px,
-                    py,
-                    [
-                        blend(glyph_rgb[0], bg[0]),
-                        blend(glyph_rgb[1], bg[1]),
-                        blend(glyph_rgb[2], bg[2]),
-                        0xff,
-                    ],
-                );
+                self.pixmap.set(px, py, over(src, bg));
                 drawn = true;
             }
         });
@@ -1814,8 +1848,7 @@ impl Application {
                         .child(div().text_xs().child(if trim {
                             format!(
                                 "1 to {MAX_CANVAS_SIZE} px. The image is trimmed from the top-left of the selection; \
-                                 areas outside the image are filled with the background color."
-                            )
+                                areas outside the image become transparent.")
                         } else {
                             format!("1 to {MAX_CANVAS_SIZE} px. The image stays anchored at the top-left.")
                         })),
@@ -2241,7 +2274,7 @@ impl Application {
     ) {
         match action {
             DiscardAction::NewDocument => {
-                let pixmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND);
+                let pixmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND_WHITE);
                 self.replace_pixmap(pixmap, false);
                 self.file_path = None;
                 self.scroll = (0., 0.);
@@ -2358,15 +2391,32 @@ impl Application {
             return false;
         };
 
-        let data: Vec<u8> = pixmap.pixels.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
-        let Some(img) = image::RgbImage::from_raw(pixmap.width as u32, pixmap.height as u32, data) else {
+        // formats that can store transparency; the others get the image flattened onto white
+        let keep_alpha = matches!(
+            format,
+            image::ImageFormat::Png | image::ImageFormat::WebP | image::ImageFormat::Gif | image::ImageFormat::Tiff
+        );
+        let (w, h) = (pixmap.width as u32, pixmap.height as u32);
+        let dynamic = if keep_alpha {
+            let data: Vec<u8> = pixmap.pixels.iter().flatten().copied().collect();
+            image::RgbaImage::from_raw(w, h, data).map(image::DynamicImage::ImageRgba8)
+        } else {
+            let data: Vec<u8> = pixmap.pixels.iter().flat_map(|p| {
+                let a = p[3] as u32;
+                let f = |c: u8| ((c as u32 * a + 255 * (255 - a) + 127) / 255) as u8;
+                [f(p[0]), f(p[1]), f(p[2])]
+            }).collect();
+            image::RgbImage::from_raw(w, h, data).map(image::DynamicImage::ImageRgb8)
+        };
+        let Some(img) = dynamic else {
             show_error("Failed to build the image.");
             return false;
         };
-        if let Err(e) = image::DynamicImage::ImageRgb8(img).save_with_format(&path, format) {
+        if let Err(e) = img.save_with_format(&path, format) {
             show_error(&format!("Failed to save the image: {e}"));
             return false;
         }
+
         self.file_path = Some(path);
         self.saved_depth = Some(saved_depth);
         self.mark_dirty();
@@ -2830,7 +2880,7 @@ fn hex_to_rgba(hex: u32) -> [u8; 4] {
 fn to_rgba8(color: Hsla) -> [u8; 4] {
     let c: Rgba = color.into();
     let q = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
-    [q(c.r), q(c.g), q(c.b), 0xff]
+    [q(c.r), q(c.g), q(c.b), q(c.a)]
 }
 /// convert a gpui color into an opaque RGB pixel
 fn to_rgb8(color: Hsla) -> [u8; 3] {
