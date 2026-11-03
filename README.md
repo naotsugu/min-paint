@@ -4,6 +4,24 @@ Minimal paint application.
 
 ![screenshot1](docs/screenshot-01.png)
 
+
+## Installing
+
+Download the latest [min-paint release](https://github.com/naotsugu/min-paint/releases) and unzip it.
+
+### Launching app on macOS
+
+By default, macOS allows you to open apps from the official Mac App Store only. If you have this still set as your default, you will be seeing the warning when you try to open an app for the first time.
+
+The easiest way to allow an app from an unidentified developer to run on macOS is to ⌘-click the app and click Open.
+
+    Press ⌘ while clicking the app
+    Click the Open button from the shortcut menu.
+    Click Open again.
+
+After that, the app will be saved as a safe app to open, and you can double-click to use it in the future as you can with any registered apps.
+
+
 ## How to build
 
 ### Apple silicon
