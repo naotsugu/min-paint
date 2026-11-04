@@ -1,8 +1,8 @@
 //! Native clipboard access for Windows.
 //!
 //! gpui only publishes the registered "PNG" format, so apps that read CF_DIB /
-//! CF_BITMAP / CF_DIBV5 cannot paste the image. Windows synthesizes the other
-//! pixel map formats from CF_DIB automatically.
+//! CF_BITMAP / CF_DIBV5 cannot paste the image. Transparency is preserved in
+//! "PNG" and CF_DIBV5; CF_DIB (which has no alpha) is flattened onto white.
 
 use std::ffi::c_void;
 
@@ -34,6 +34,7 @@ unsafe extern "system" {
 }
 
 /// Build a 24bpp bottom-up CF_DIB payload (BITMAPINFOHEADER + pixel rows).
+/// CF_DIB has no alpha, so transparent pixels are composited onto white.
 fn build_dib(width: usize, height: usize, pixels: &[[u8; 4]]) -> Vec<u8> {
     let stride = (width * 3 + 3) & !3; // rows are padded to 4 bytes
     let image_size = stride * height;
@@ -52,12 +53,53 @@ fn build_dib(width: usize, height: usize, pixels: &[[u8; 4]]) -> Vec<u8> {
     dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
     dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
 
+    // source over white
+    let flat = |c: u8, a: u32| ((c as u32 * a + 255 * (255 - a) + 127) / 255) as u8;
+
     for y in (0..height).rev() {
         let row = &pixels[y * width..(y + 1) * width];
         for p in row {
-            dib.extend_from_slice(&[p[2], p[1], p[0]]); // BGR
+            let a = p[3] as u32;
+            dib.extend_from_slice(&[flat(p[2], a), flat(p[1], a), flat(p[0], a)]); // BGR
         }
         dib.resize(dib.len() + (stride - width * 3), 0);
+    }
+    dib
+}
+
+/// Build a 32bpp bottom-up CF_DIBV5 payload with a straight (non-premultiplied) alpha channel.
+fn build_dibv5(width: usize, height: usize, pixels: &[[u8; 4]]) -> Vec<u8> {
+    let image_size = width * height * 4;
+    let mut dib = Vec::with_capacity(124 + image_size);
+
+    // BITMAPV5HEADER (124 bytes)
+    dib.extend_from_slice(&124u32.to_le_bytes()); // bV5Size
+    dib.extend_from_slice(&(width as i32).to_le_bytes()); // bV5Width
+    dib.extend_from_slice(&(height as i32).to_le_bytes()); // bV5Height (positive = bottom-up)
+    dib.extend_from_slice(&1u16.to_le_bytes()); // bV5Planes
+    dib.extend_from_slice(&32u16.to_le_bytes()); // bV5BitCount
+    dib.extend_from_slice(&3u32.to_le_bytes()); // bV5Compression = BI_BITFIELDS
+    dib.extend_from_slice(&(image_size as u32).to_le_bytes()); // bV5SizeImage
+    dib.extend_from_slice(&0i32.to_le_bytes()); // bV5XPelsPerMeter
+    dib.extend_from_slice(&0i32.to_le_bytes()); // bV5YPelsPerMeter
+    dib.extend_from_slice(&0u32.to_le_bytes()); // bV5ClrUsed
+    dib.extend_from_slice(&0u32.to_le_bytes()); // bV5ClrImportant
+    dib.extend_from_slice(&0x00FF_0000u32.to_le_bytes()); // bV5RedMask
+    dib.extend_from_slice(&0x0000_FF00u32.to_le_bytes()); // bV5GreenMask
+    dib.extend_from_slice(&0x0000_00FFu32.to_le_bytes()); // bV5BlueMask
+    dib.extend_from_slice(&0xFF00_0000u32.to_le_bytes()); // bV5AlphaMask
+    dib.extend_from_slice(&0x7352_4742u32.to_le_bytes()); // bV5CSType = LCS_sRGB ('sRGB')
+    dib.extend_from_slice(&[0u8; 36]); // bV5Endpoints (unused for sRGB)
+    dib.extend_from_slice(&[0u8; 12]); // bV5GammaRed / Green / Blue
+    dib.extend_from_slice(&4u32.to_le_bytes()); // bV5Intent = LCS_GM_IMAGES
+    dib.extend_from_slice(&0u32.to_le_bytes()); // bV5ProfileData
+    dib.extend_from_slice(&0u32.to_le_bytes()); // bV5ProfileSize
+    dib.extend_from_slice(&0u32.to_le_bytes()); // bV5Reserved
+
+    for y in (0..height).rev() {
+        for p in &pixels[y * width..(y + 1) * width] {
+            dib.extend_from_slice(&[p[2], p[1], p[0], p[3]]); // BGRA
+        }
     }
     dib
 }
@@ -85,12 +127,14 @@ fn set_data(format: u32, data: &[u8]) -> bool {
     }
 }
 
-/// Put the image on the clipboard as CF_DIB (+ "PNG" for apps that prefer it).
+/// Put the image on the clipboard as "PNG" and CF_DIBV5 (both with alpha),
+/// plus CF_DIB flattened onto white for apps that know nothing about transparency.
 pub fn copy_image(width: usize, height: usize, pixels: &[[u8; 4]], png: &[u8]) -> Result<(), String> {
     if width == 0 || height == 0 || pixels.len() != width * height {
         return Err("invalid image size".to_string());
     }
     let dib = build_dib(width, height, pixels);
+    let dibv5 = build_dibv5(width, height, pixels);
 
     unsafe {
         // another process may hold the clipboard for a moment, so retry briefly
@@ -109,18 +153,21 @@ pub fn copy_image(width: usize, height: usize, pixels: &[[u8; 4]], png: &[u8]) -
 
         EmptyClipboard();
 
-        // registered "PNG" format: preserved as-is by browsers, Office, etc.
+        // registered "PNG" format: keeps the alpha channel in browsers, Office, etc.
         let name: Vec<u16> = "PNG\0".encode_utf16().collect();
         let png_format = RegisterClipboardFormatW(name.as_ptr());
         if png_format != 0 {
             set_data(png_format, png);
         }
 
-        // CF_DIB: Windows derives CF_BITMAP and CF_DIBV5 from it
+        // Set both DIB formats explicitly: when only one is set, Windows synthesizes
+        // the other one, and the synthesized CF_DIB would show transparent pixels as black.
+        // CF_DIBV5 keeps the alpha; CF_DIB is the white-flattened fallback.
+        let ok_v5 = set_data(CF_DIBV5, &dibv5);
         let ok = set_data(CF_DIB, &dib);
         CloseClipboard();
 
-        if ok { Ok(()) } else { Err("failed to set CF_DIB".to_string()) }
+        if ok || ok_v5 { Ok(()) } else { Err("failed to set CF_DIB".to_string()) }
     }
 }
 
