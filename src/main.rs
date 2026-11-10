@@ -3241,7 +3241,8 @@ fn window_options(cx: &mut App) -> WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         focus: true,
         titlebar: Some(TitlebarOptions {
-            title: Some(SharedString::new("min-paint")),
+            title: Some(SharedString::new(
+                format!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))),
             appears_transparent: false,
             traffic_light_position: None,
         }),
