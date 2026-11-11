@@ -955,6 +955,10 @@ pub struct Application {
     // font
     font_system: Option<cosmic_text::FontSystem>,
     swash_cache: Option<cosmic_text::SwashCache>,
+    // installed font families (sorted, unique); built on first use
+    font_families: Vec<String>,
+    // font chosen last time in the text dialog
+    text_font: Option<String>,
     // keep subscriptions alive for the lifetime of the view
     _subscriptions: Vec<Subscription>,
 }
@@ -1095,6 +1099,8 @@ impl Application {
             focus_handle: cx.focus_handle(),
             font_system: None,
             swash_cache: None,
+            font_families: Vec::new(),
+            text_font: None,
             _subscriptions: vec![color_sub, size_sub, zoom_sub, appearance_sub],
         };
         // give the canvas the keyboard focus at startup so that the shortcuts work at once
@@ -1802,7 +1808,45 @@ impl Application {
         self.shape_bounds = Some((x0 - margin, y0 - margin, x1 + margin + 1, y1 + margin + 1));
     }
 
+    // collect the installed font families (once)
+    fn ensure_font_families(&mut self) {
+        if !self.font_families.is_empty() {
+            return;
+        }
+        let font_system = self.font_system.get_or_insert_with(cosmic_text::FontSystem::new);
+        let mut families: Vec<String> = font_system
+            .db()
+            .faces()
+            .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
+            // names starting with '.' are hidden system fonts (e.g. ".AI Bayan PUA" on macOS)
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+        families.sort_by_key(|s| s.to_lowercase());
+        families.dedup();
+        if families.is_empty() {
+            families.push("sans-serif".to_string());
+        }
+        self.font_families = families;
+    }
+
+    // default font for the first use: the first installed font of a per-OS candidate list
+    fn default_font_family(&self) -> Option<String> {
+        const CANDIDATES: &[&str] = if cfg!(target_os = "macos") {
+            &["Hiragino Sans", "Helvetica Neue", "Helvetica", "Arial"]
+        } else if cfg!(windows) {
+            &["Yu Gothic UI", "Meiryo UI", "Segoe UI", "Arial"]
+        } else {
+            &["Noto Sans CJK JP", "Noto Sans", "DejaVu Sans", "Arial"]
+        };
+        CANDIDATES
+            .iter()
+            .find_map(|c| self.font_families.iter().find(|f| f.as_str() == *c))
+            .cloned()
+    }
+
     fn draw_text(&mut self, origin: (i32, i32), window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_font_families();
+
         let app = cx.entity();
         let default_font_size = (self.brush_size * 8).clamp(12, 120);
         let text_input = cx.new(|cx| InputState::new(window, cx).placeholder("Enter text..."));
@@ -1813,6 +1857,19 @@ impl Application {
                 .min(6.)
                 .max(500.)
         });
+
+        // font select: preselect the font used last time,
+        // or the system default (sans-serif) font on the first use
+        let preferred = self.text_font.clone().or_else(|| self.default_font_family());
+        let families = self.font_families.clone();
+        let selected = preferred
+            .as_ref()
+            .and_then(|name| families.iter().position(|f| f == name))
+            .unwrap_or(0);
+        let font_select = cx.new(|cx| {
+            SelectState::new(families, Some(IndexPath::new(selected)), window, cx)
+        });
+
         let initial_focus = Cell::new(true);
 
         window.open_dialog(cx, move |dialog, window, cx| {
@@ -1820,9 +1877,31 @@ impl Application {
                 text_input.focus_handle(cx).focus(window, cx);
             }
 
-            let app = app.clone();
-            let text_input_clone = text_input.clone();
-            let font_size_input_clone = font_size_input.clone();
+            // Shared by the OK button and the Enter key.
+            // Returns true when the dialog should be closed.
+            let submit: Rc<dyn Fn(&mut Window, &mut App) -> bool> = {
+                let app = app.clone();
+                let text_input = text_input.clone();
+                let font_size_input = font_size_input.clone();
+                let font_select = font_select.clone();
+                Rc::new(move |_window: &mut Window, cx: &mut App| -> bool {
+                    let text = text_input.read(cx).value().to_string();
+                    // reject invalid sizes instead of silently falling back to a default
+                    let Ok(font_size) = font_size_input.read(cx).value().parse::<f32>() else {
+                        show_error("Enter the font size as a number.");
+                        return false;
+                    };
+                    let font_size = font_size.clamp(6.0, 500.0);
+                    let family: Option<String> = font_select.read(cx).selected_value().cloned();
+                    if !text.is_empty() {
+                        app.update(cx, |this, cx| {
+                            this.text_font = family.clone();
+                            this.render_text(&text, font_size, family.as_deref(), origin, cx);
+                        });
+                    }
+                    true
+                })
+            };
 
             let row = |label: &'static str, input: &Entity<InputState>| {
                 div()
@@ -1834,9 +1913,15 @@ impl Application {
                     .child(div().flex_1().child(NumberInput::new(input)))
             };
 
+            let submit_for_button = submit.clone();
+            let submit_for_enter = submit.clone();
+
             dialog
                 .title("Draw text")
                 .w(px(320.))
+                // Enter in an input runs the same action as the OK button
+                .on_ok(move |_, window, cx| submit_for_enter(window, cx))
+                .on_cancel(|_, _, _| true)
                 .child(
                     div()
                         .flex()
@@ -1851,6 +1936,15 @@ impl Application {
                                 .child(div().w(px(56.)).text_sm().child("Text"))
                                 .child(div().flex_1().child(Input::new(&text_input))),
                         )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(div().w(px(56.)).text_sm().child("Font"))
+                                .child(div().flex_1().child(Select::new(&font_select))),
+                        )
                         .child(row("Size", &font_size_input))
                         .child(div().text_xs().child("Text will be drawn at the clicked position.")),
                 )
@@ -1861,19 +1955,9 @@ impl Application {
                                 .primary()
                                 .label("OK")
                                 .on_click(move |_, window, cx| {
-                                    let text = text_input_clone.read(cx).value().to_string();
-                                    // reject invalid sizes instead of silently falling back to a default
-                                    let Ok(font_size) = font_size_input_clone.read(cx).value().parse::<f32>() else {
-                                        show_error("Enter the font size as a number.");
-                                        return;
-                                    };
-                                    let font_size = font_size.clamp(6.0, 500.0);
-                                    if !text.is_empty() {
-                                        app.update(cx, |this, cx| {
-                                            this.render_text(&text, font_size, origin, cx);
-                                        });
+                                    if submit_for_button(window, cx) {
+                                        window.close_dialog(cx);
                                     }
-                                    window.close_dialog(cx);
                                 }),
                         )
                         .child(
@@ -1887,14 +1971,24 @@ impl Application {
         });
     }
 
-    fn render_text(&mut self, text: &str, font_size: f32, origin: (i32, i32), cx: &mut Context<Self>) {
+    fn render_text(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        family: Option<&str>,
+        origin: (i32, i32),
+        cx: &mut Context<Self>
+    ) {
         let font_system = self.font_system.get_or_insert_with(cosmic_text::FontSystem::new);
         let swash_cache = self.swash_cache.get_or_insert_with(cosmic_text::SwashCache::new);
 
         let metrics = cosmic_text::Metrics::new(font_size, font_size * 1.25);
         let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
         let mut buffer = buffer.borrow_with(font_system);
-        let attrs = cosmic_text::Attrs::new();
+        let attrs = match family {
+            Some(name) => cosmic_text::Attrs::new().family(cosmic_text::Family::Name(name)),
+            None => cosmic_text::Attrs::new(),
+        };
         buffer.set_text(text, &attrs, cosmic_text::Shaping::Advanced, None);
         buffer.shape_until_scroll(false);
 
@@ -2022,9 +2116,19 @@ impl Application {
             };
 
             let app = app.clone();
+            // Shared by the OK button and the Enter key.
+            // Returns true when the dialog should be closed (only if the size was valid).
+            let app_for_enter = app.clone();
+            let app_for_button = app.clone();
+
             dialog
                 .title(if trim { "Trim to selection" } else { "Resize canvas" })
                 .w(px(320.))
+                // Enter in an input runs the same action as the OK button
+                .on_ok(move |_, window, cx| {
+                    app_for_enter.update(cx, |this, cx| this.apply_resize(window, cx))
+                })
+                .on_cancel(|_, _, _| true)
                 .child(
                     div()
                         .flex()
@@ -2048,7 +2152,7 @@ impl Application {
                                 .label("OK")
                                 .on_click(move |_, window, cx| {
                                     // close only when the size was valid
-                                    let applied = app.update(cx, |this, cx| this.apply_resize(window, cx));
+                                    let applied = app_for_button.update(cx, |this, cx| this.apply_resize(window, cx));
                                     if applied {
                                         window.close_dialog(cx);
                                     }
