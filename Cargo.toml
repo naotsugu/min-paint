@@ -1,6 +1,6 @@
 [package]
 name = "min-paint"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Minimal paint application"
 authors = ["Naotsugu Kobayashi <naotsugukobayashi@gmail.com>"]

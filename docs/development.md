@@ -10,13 +10,13 @@ Commit changes.
 
 ```
 git add -A
-git commit -m "Release v0.2.1"
+git commit -m "Release v0.2.2"
 git push origin main:main
 ```
 
 By pushing a tag, the github action creates a release.
 
 ```
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
