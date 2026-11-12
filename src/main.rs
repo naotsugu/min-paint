@@ -19,6 +19,9 @@ use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::Theme;
 
+use rust_i18n::t;
+rust_i18n::i18n!();
+
 // Windows-only native clipboard access (CF_DIB / CF_DIBV5 / "PNG")
 #[cfg(windows)]
 mod win_clipboard;
@@ -2122,7 +2125,7 @@ impl Application {
             let app_for_button = app.clone();
 
             dialog
-                .title(if trim { "Trim to selection" } else { "Resize canvas" })
+                .title(if trim { t!("dialog.trim.title") } else { t!("dialog.risize.title") })
                 .w(px(320.))
                 // Enter in an input runs the same action as the OK button
                 .on_ok(move |_, window, cx| {
@@ -2137,11 +2140,9 @@ impl Application {
                         .child(row("Width", &width_input))
                         .child(row("Height", &height_input))
                         .child(div().text_xs().child(if trim {
-                            format!(
-                                "1 to {MAX_CANVAS_SIZE} px. The image is trimmed from the top-left of the selection; \
-                                areas outside the image become transparent.")
+                            t!("dialog.trim.msg", max_size = MAX_CANVAS_SIZE)
                         } else {
-                            format!("1 to {MAX_CANVAS_SIZE} px. The image stays anchored at the top-left.")
+                            t!("dialog.resize.msg", max_size = MAX_CANVAS_SIZE)
                         })),
                 )
                 .footer(
@@ -3261,7 +3262,7 @@ fn confirm_unsaved() -> rfd::MessageDialogResult {
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Warning)
         .set_title("min-paint")
-        .set_description("The image has unsaved changes. Save them first?")
+        .set_description(t!("confirm.unsaved"))
         .set_buttons(rfd::MessageButtons::YesNoCancel)
         .show()
 }
@@ -3285,6 +3286,11 @@ fn update_theme_color(cx: &mut App) {
 }
 
 fn main() {
+
+    // i18n
+    if let Some(locale) = sys_locale::get_locale() {
+        rust_i18n::set_locale(&locale);
+    }
 
     // the first command line argument is the image file to open
     let initial_file: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);

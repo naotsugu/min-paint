@@ -3702,6 +3702,8 @@ dependencies = [
  "gpui-kit",
  "image",
  "rfd",
+ "rust-i18n",
+ "sys-locale",
  "winresource",
 ]
 

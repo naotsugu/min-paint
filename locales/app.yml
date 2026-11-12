@@ -1,0 +1,17 @@
+_version: 2
+confirm.unsaved:
+  en: The image has unsaved changes. Save changes before leaving?
+  ja: 保存されていない変更があります。変更を保存しますか?
+dialog.trim.title:
+  en: Trim to selection
+  ja: トリム
+dialog.trim.msg:
+  en: 1 to &{max_size} px. The image is trimmed from the top-left of the selection areas outside the image become transparent.
+  ja: 1〜&{max_size} px。画像は左上を基準にトリミングされ、画像範囲外の選択領域は透明になります。
+dialog.resize.title:
+  en: Resize canvas
+  ja: リサイズ
+dialog.resize.msg:
+  en: 1 to {max_size} px. The image stays anchored at the top-left.
+  ja: 1〜{max_size} px。画像は左上にアンカーされます。
+
