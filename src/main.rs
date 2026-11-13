@@ -3261,7 +3261,7 @@ fn save_format(path: &Path) -> Option<image::ImageFormat> {
 fn confirm_unsaved() -> rfd::MessageDialogResult {
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Warning)
-        .set_title("min-paint")
+        .set_title(env!("CARGO_PKG_NAME"))
         .set_description(t!("confirm.unsaved"))
         .set_buttons(rfd::MessageButtons::YesNoCancel)
         .show()
@@ -3339,7 +3339,7 @@ actions!(min_paint, [Quit]);
 fn set_app_menu(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
     cx.set_menus(vec![Menu {
-        name: "min-paint".into(),
+        name: env!("CARGO_PKG_NAME").into(),
         items: vec![MenuItem::action("Quit min-paint", Quit)],
         disabled: false,
     }]);
