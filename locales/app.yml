@@ -1,17 +1,145 @@
 _version: 2
-confirm.unsaved:
-  en: The image has unsaved changes. Save changes before leaving?
-  ja: 保存されていない変更があります。変更を保存しますか?
-dialog.trim.title:
-  en: Trim to selection
-  ja: トリム
-dialog.trim.msg:
-  en: 1 to &{max_size} px. The image is trimmed from the top-left of the selection areas outside the image become transparent.
-  ja: 1〜&{max_size} px。画像は左上を基準にトリミングされ、画像範囲外の選択領域は透明になります。
-dialog.resize.title:
-  en: Resize canvas
-  ja: リサイズ
-dialog.resize.msg:
-  en: 1 to {max_size} px. The image stays anchored at the top-left.
-  ja: 1〜{max_size} px。画像は左上にアンカーされます。
 
+confirm.unsaved:
+  en: "The image has unsaved changes.\nSave changes before leaving?"
+  ja: "保存されていない変更があります. \n変更を保存しますか?"
+  zh-CN: "图像有未保存的更改. \n是否在离开前保存更改?"
+  zh-TW: "影像有尚未儲存的變更. \n是否在離開前儲存變更?"
+  ko: "저장되지 않은 변경 사항이 있습니다.\n나가기 전에 저장하시겠습니까?"
+  es: "La imagen tiene cambios sin guardar.\n¿Guardar los cambios antes de salir?"
+  fr: "L'image contient des modifications non enregistrées.\nEnregistrer les modifications avant de quitter ?"
+  de: "Das Bild hat nicht gespeicherte Änderungen.\nÄnderungen vor dem Beenden speichern?"
+
+dialog.error.title:
+  en: "Error"
+  ja: "エラー"
+  zh-CN: "错误"
+  zh-TW: "錯誤"
+  ko: "오류"
+  es: "Error"
+  fr: "Erreur"
+  de: "Fehler"
+
+dialog.trim.title:
+  en: "Trim to selection"
+dialog.trim.msg:
+  en: "1 to %{max_size} px.\nThe image is trimmed from the top-left of the selection; areas outside the image become transparent."
+  ja: "1〜%{max_size} px. \n画像は選択範囲の左上を基準にトリミングされ、画像範囲外の領域は透明になります."
+  zh-CN: "1 到 %{max_size} 像素. \n图像以选区左上角为基准裁剪,图像范围外的区域将变为透明."
+  zh-TW: "1 到 %{max_size} 像素. \n影像會以選取範圍的左上角為基準裁切,影像範圍外的區域將變為透明."
+  ko: "1~%{max_size} px.\n이미지는 선택 영역의 왼쪽 위를 기준으로 잘리며, 이미지 밖의 영역은 투명해집니다."
+  es: "De 1 a %{max_size} px.\nLa imagen se recorta desde la esquina superior izquierda de la selección; las áreas fuera de la imagen quedan transparentes."
+  fr: "De 1 à %{max_size} px.\nL'image est rognée à partir du coin supérieur gauche de la sélection ; les zones hors de l'image deviennent transparentes."
+  de: "1 bis %{max_size} px.\nDas Bild wird ab der oberen linken Ecke der Auswahl zugeschnitten; Bereiche außerhalb des Bildes werden transparent."
+
+dialog.resize.title:
+  en: "Resize canvas"
+dialog.resize.msg:
+  en: "1 to %{max_size} px.\nThe image stays anchored at the top-left."
+  ja: "1〜%{max_size} px. \n画像は左上に固定されます."
+  zh-CN: "1 到 %{max_size} 像素. \n图像固定在左上角."
+  zh-TW: "1 到 %{max_size} 像素. \n影像固定在左上角."
+  ko: "1~%{max_size} px.\n이미지는 왼쪽 위에 고정됩니다."
+  es: "De 1 a %{max_size} px.\nLa imagen permanece anclada en la esquina superior izquierda."
+  fr: "De 1 à %{max_size} px.\nL'image reste ancrée en haut à gauche."
+  de: "1 bis %{max_size} px.\nDas Bild bleibt oben links verankert."
+
+error.encode_image:
+  en: "Failed to encode the image: %{error}"
+  ja: "画像のエンコードに失敗しました: %{error}"
+  zh-CN: "图像编码失败: %{error}"
+  zh-TW: "影像編碼失敗: %{error}"
+  ko: "이미지 인코딩에 실패했습니다: %{error}"
+  es: "No se pudo codificar la imagen: %{error}"
+  fr: "Échec de l'encodage de l'image : %{error}"
+  de: "Das Bild konnte nicht kodiert werden: %{error}"
+
+error.clipboard_read:
+  en: "Failed to read the clipboard image: %{error}"
+  ja: "クリップボードの画像を読み取れませんでした: %{error}"
+  zh-CN: "无法读取剪贴板中的图像: %{error}"
+  zh-TW: "無法讀取剪貼簿中的影像: %{error}"
+  ko: "클립보드 이미지를 읽지 못했습니다: %{error}"
+  es: "No se pudo leer la imagen del portapapeles: %{error}"
+  fr: "Impossible de lire l'image du presse-papiers : %{error}"
+  de: "Das Bild aus der Zwischenablage konnte nicht gelesen werden: %{error}"
+
+error.clipboard_size:
+  en: "The clipboard image must be at most %{max_size} px on each side."
+  ja: "クリップボードの画像は、縦横とも %{max_size} px 以下にしてください."
+  zh-CN: "剪贴板中的图像每边不得超过 %{max_size} 像素."
+  zh-TW: "剪貼簿中的影像每邊不得超過 %{max_size} 像素."
+  ko: "클립보드 이미지는 각 변이 최대 %{max_size} px여야 합니다."
+  es: "La imagen del portapapeles debe medir como máximo %{max_size} px por lado."
+  fr: "L'image du presse-papiers ne doit pas dépasser %{max_size} px de chaque côté."
+  de: "Das Bild aus der Zwischenablage darf pro Seite höchstens %{max_size} px groß sein."
+
+error.font_size:
+  en: "Enter the font size as a number."
+  ja: "フォントサイズは数値で入力してください."
+  zh-CN: "请以数字输入字体大小."
+  zh-TW: "請以數字輸入字型大小."
+  ko: "글꼴 크기를 숫자로 입력하세요."
+  es: "Introduce el tamaño de fuente como un número."
+  fr: "Saisissez la taille de police sous forme de nombre."
+  de: "Geben Sie die Schriftgröße als Zahl ein."
+
+error.size_not_number:
+  en: "Enter the width and height as whole numbers."
+  ja: "幅と高さは整数で入力してください."
+  zh-CN: "请以整数输入宽度和高度."
+  zh-TW: "請以整數輸入寬度和高度."
+  ko: "너비와 높이를 정수로 입력하세요."
+  es: "Introduce el ancho y el alto como números enteros."
+  fr: "Saisissez la largeur et la hauteur sous forme de nombres entiers."
+  de: "Geben Sie Breite und Höhe als ganze Zahlen ein."
+
+error.size_range:
+  en: "The size must be between 1 and %{max_size}."
+  ja: "サイズは 1〜%{max_size} の範囲で指定してください."
+  zh-CN: "大小必须在 1 到 %{max_size} 之间."
+  zh-TW: "大小必須介於 1 到 %{max_size} 之間."
+  ko: "크기는 1에서 %{max_size} 사이여야 합니다."
+  es: "El tamaño debe estar entre 1 y %{max_size}."
+  fr: "La taille doit être comprise entre 1 et %{max_size}."
+  de: "Die Größe muss zwischen 1 und %{max_size} liegen."
+
+error.open_image:
+  en: "Failed to open the image: %{error}"
+  ja: "画像を開けませんでした: %{error}"
+  zh-CN: "无法打开图像: %{error}"
+  zh-TW: "無法開啟影像: %{error}"
+  ko: "이미지를 열지 못했습니다: %{error}"
+  es: "No se pudo abrir la imagen: %{error}"
+  fr: "Impossible d'ouvrir l'image : %{error}"
+  de: "Das Bild konnte nicht geöffnet werden: %{error}"
+
+error.unsupported_ext:
+  en: "Unsupported file extension. Use png, jpg, bmp, gif, tif or webp."
+  ja: "未対応のファイル拡張子です. png, jpg, bmp, gif, tif, webp のいずれかを使用してください."
+  zh-CN: "不支持的文件扩展名. 请使用 png、jpg、bmp、gif、tif 或 webp."
+  zh-TW: "不支援的副檔名. 請使用 png、jpg、bmp、gif、tif 或 webp."
+  ko: "지원하지 않는 파일 확장자입니다. png, jpg, bmp, gif, tif 또는 webp를 사용하세요."
+  es: "Extensión de archivo no compatible. Usa png, jpg, bmp, gif, tif o webp."
+  fr: "Extension de fichier non prise en charge. Utilisez png, jpg, bmp, gif, tif ou webp."
+  de: "Nicht unterstützte Dateiendung. Verwenden Sie png, jpg, bmp, gif, tif oder webp."
+
+error.build_image:
+  en: "Failed to build the image."
+  ja: "画像を生成できませんでした."
+  zh-CN: "无法生成图像."
+  zh-TW: "無法產生影像."
+  ko: "이미지를 생성하지 못했습니다."
+  es: "No se pudo generar la imagen."
+  fr: "Impossible de générer l'image."
+  de: "Das Bild konnte nicht erstellt werden."
+
+error.save_image:
+  en: "Failed to save the image: %{error}"
+  ja: "画像を保存できませんでした: %{error}"
+  zh-CN: "无法保存图像: %{error}"
+  zh-TW: "無法儲存影像: %{error}"
+  ko: "이미지를 저장하지 못했습니다: %{error}"
+  es: "No se pudo guardar la imagen: %{error}"
+  fr: "Impossible d'enregistrer l'image : %{error}"
+  de: "Das Bild konnte nicht gespeichert werden: %{error}"

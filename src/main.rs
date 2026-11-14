@@ -20,7 +20,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::Theme;
 
 use rust_i18n::t;
-rust_i18n::i18n!();
+rust_i18n::i18n!("locales", fallback = "en");
 
 // Windows-only native clipboard access (CF_DIB / CF_DIBV5 / "PNG")
 #[cfg(windows)]
@@ -1604,7 +1604,7 @@ impl Application {
         // encode as PNG and put it on the clipboard through gpui
         let mut png = Vec::new();
         if let Err(e) = buffer.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png) {
-            show_error(&format!("Failed to encode the image: {e}"));
+            show_error(&t!("error.encode_image", error = e));
             return;
         }
 
@@ -1641,7 +1641,7 @@ impl Application {
         };
         image::load_from_memory(&clip_image.bytes)
             .map(|img| Some(img.to_rgba8()))
-            .map_err(|e| format!("Failed to read the clipboard image: {e}"))
+            .map_err(|e| t!("error.clipboard_read", error = e).to_string())
     }
 
     // paste the clipboard image as a floating selection that can be moved before it is committed
@@ -1658,7 +1658,7 @@ impl Application {
         };
         let (w, h) = (decoded.width() as usize, decoded.height() as usize);
         if w == 0 || h == 0 || w > MAX_CANVAS_SIZE || h > MAX_CANVAS_SIZE {
-            show_error(&format!("The clipboard image must be at most {MAX_CANVAS_SIZE} px on each side."));
+            show_error(&t!("error.clipboard_size", max_size = MAX_CANVAS_SIZE));
             return;
         }
         let pasted = Pixmap::from(decoded);
@@ -1891,7 +1891,7 @@ impl Application {
                     let text = text_input.read(cx).value().to_string();
                     // reject invalid sizes instead of silently falling back to a default
                     let Ok(font_size) = font_size_input.read(cx).value().parse::<f32>() else {
-                        show_error("Enter the font size as a number.");
+                        show_error(&t!("error.font_size"));
                         return false;
                     };
                     let font_size = font_size.clamp(6.0, 500.0);
@@ -2062,11 +2062,11 @@ impl Application {
         let width = self.width_input.read(cx).value().parse::<usize>().ok();
         let height = self.height_input.read(cx).value().parse::<usize>().ok();
         let (Some(width), Some(height)) = (width, height) else {
-            show_error("Enter the width and height as whole numbers.");
+            show_error(&t!("error.size_not_number"));
             return false;
         };
         if width == 0 || height == 0 || width > MAX_CANVAS_SIZE || height > MAX_CANVAS_SIZE {
-            show_error(&format!("The size must be between 1 and {MAX_CANVAS_SIZE}."));
+            show_error(&t!("error.size_range", max_size = MAX_CANVAS_SIZE));
             return false;
         }
         // the trim origin is the top-left corner of the selection (the canvas origin if nothing is selected);
@@ -2125,7 +2125,7 @@ impl Application {
             let app_for_button = app.clone();
 
             dialog
-                .title(if trim { t!("dialog.trim.title") } else { t!("dialog.risize.title") })
+                .title(if trim { t!("dialog.trim.title") } else { t!("dialog.resize.title") })
                 .w(px(320.))
                 // Enter in an input runs the same action as the OK button
                 .on_ok(move |_, window, cx| {
@@ -2603,7 +2603,7 @@ impl Application {
                 let img = match image::open(&path) {
                     Ok(img) => img.to_rgba8(),
                     Err(e) => {
-                        show_error(&format!("Failed to open the image: {e}"));
+                        show_error(&t!("error.open_image", error = e));
                         return;
                     }
                 };
@@ -2706,7 +2706,7 @@ impl Application {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(format) = save_format(&path) else {
-            show_error("Unsupported file extension. Use png, jpg, bmp, gif, tif or webp.");
+            show_error(&t!("error.unsupported_ext"));
             return false;
         };
 
@@ -2728,11 +2728,11 @@ impl Application {
             image::RgbImage::from_raw(w, h, data).map(image::DynamicImage::ImageRgb8)
         };
         let Some(img) = dynamic else {
-            show_error("Failed to build the image.");
+            show_error(&t!("error.build_image"));
             return false;
         };
         if let Err(e) = img.save_with_format(&path, format) {
-            show_error(&format!("Failed to save the image: {e}"));
+            show_error(&t!("error.save_image", error = e));
             return false;
         }
 
@@ -3271,7 +3271,7 @@ fn show_error(message: &str) {
     // the release build has no console, so report errors with a dialog
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
-        .set_title("Error")
+        .set_title(t!("dialog.error.title"))
         .set_description(message)
         .show();
 }

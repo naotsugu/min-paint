@@ -3,6 +3,7 @@ use std::{env, path::PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets");
+    println!("cargo:rerun-if-changed=locals");
 
     // IMPORTANT: use CARGO_CFG_* instead of cfg!(...).
     // build.rs runs on the HOST, so cfg!(target_os) would report the host OS
