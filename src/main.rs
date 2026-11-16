@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,6 +21,12 @@ use gpui_kit::component::Theme;
 
 use rust_i18n::t;
 rust_i18n::i18n!("locales", fallback = "en");
+
+mod model;
+use model::{
+    over, save_format, Document, ImageError, Painter, Pixmap, Selection, TextRenderer, Tool,
+    BACKGROUND, BACKGROUND_WHITE,
+};
 
 // Windows-only native clipboard access (CF_DIB / CF_DIBV5 / "PNG")
 #[cfg(windows)]
@@ -57,809 +63,11 @@ const GRID_MIN_ZOOM: f32 = 8.;
 
 const DEFAULT_CANVAS_SIZE: (usize, usize) = (600, 500);
 const MAX_CANVAS_SIZE: usize = 4096;
-const MAX_HISTORY: usize = 100;
 
-// arrow proportions, as multiples of the brush size
-const ARROW_HEAD_LEN: f32 = 5.;
-const ARROW_HEAD_HALF: f32 = 2.5; // half width of the head
-const ARROW_TAIL_HALF: f32 = 1.;  // half width of the body where it is widest
-
-// mosaic cell size = brush size * this factor (so the brush size select controls the coarseness)
-const MOSAIC_BLOCK_FACTOR: i32 = 2;
-
-// transparent canvas background
-const BACKGROUND: [u8; 4] = [0, 0, 0, 0];
-const BACKGROUND_WHITE: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
 // checkerboard shown behind transparent pixels
 const CHECKER_CELL: f32 = 8.; // logical pixels
 const CHECKER_LIGHT: [u8; 3] = [0xff, 0xff, 0xff];
 const CHECKER_DARK: [u8; 3] = [0xcc, 0xcc, 0xcc];
-
-type Rect = (i32, i32, i32, i32); // x0, y0, x1, y1 (end-exclusive)
-
-fn union_rect(a: Rect, b: Rect) -> Rect {
-    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
-}
-
-/// center of a canvas pixel in continuous coordinates
-fn pixel_center(p: (i32, i32)) -> (f32, f32) {
-    (p.0 as f32 + 0.5, p.1 as f32 + 0.5)
-}
-
-type Pt = (f32, f32);
-
-/// Signed distance from `p` to a triangle (negative inside).
-/// Returns `f32::MAX` for a degenerate triangle, so that nothing is covered.
-fn triangle_distance(tri: &[Pt; 3], p: Pt) -> f32 {
-    let area = (tri[1].0 - tri[0].0) * (tri[2].1 - tri[0].1)
-        - (tri[1].1 - tri[0].1) * (tri[2].0 - tri[0].0);
-    if area.abs() < 1e-6 {
-        return f32::MAX;
-    }
-    let sign = if area > 0. { 1. } else { -1. };
-    let mut d = f32::MIN;
-    for i in 0..3 {
-        let (a, b) = (tri[i], tri[(i + 1) % 3]);
-        let (ex, ey) = (b.0 - a.0, b.1 - a.1);
-        let len = (ex * ex + ey * ey).sqrt();
-        if len < 1e-6 {
-            continue;
-        }
-        // outward unit normal of the edge
-        let (nx, ny) = (ey * sign / len, -ex * sign / len);
-        d = d.max((p.0 - a.0) * nx + (p.1 - a.1) * ny);
-    }
-    d
-}
-
-/// Bounding box of a triangle: (min_x, min_y, max_x, max_y).
-fn triangle_bounds(tri: &[Pt; 3]) -> (f32, f32, f32, f32) {
-    let xs = tri.map(|p| p.0);
-    let ys = tri.map(|p| p.1);
-    (
-        xs.iter().cloned().fold(f32::MAX, f32::min),
-        ys.iter().cloned().fold(f32::MAX, f32::min),
-        xs.iter().cloned().fold(f32::MIN, f32::max),
-        ys.iter().cloned().fold(f32::MIN, f32::max),
-    )
-}
-
-/// An arrow from `start` to `end` as two triangles: a body that tapers to a point at the
-/// start, and the head at the end. Returns `None` when the arrow has no length.
-fn arrow_triangles(start: Pt, end: Pt, size: f32) -> Option<[[Pt; 3]; 2]> {
-    let (dx, dy) = (end.0 - start.0, end.1 - start.1);
-    let len = (dx * dx + dy * dy).sqrt();
-    if len < 1. {
-        return None;
-    }
-    let (ux, uy) = (dx / len, dy / len); // direction
-    let (nx, ny) = (-uy, ux); // normal
-
-    // shrink the whole arrow head and body when the drag is short, keeping the proportions
-    let k = (len * 0.5 / (size * ARROW_HEAD_LEN)).min(1.);
-    let head_len = size * ARROW_HEAD_LEN * k;
-    let head_half = size * ARROW_HEAD_HALF * k;
-    let tail_half = size * ARROW_TAIL_HALF * k;
-
-    // base of the head
-    let hb = (end.0 - ux * head_len, end.1 - uy * head_len);
-    let head = [
-        end,
-        (hb.0 + nx * head_half, hb.1 + ny * head_half),
-        (hb.0 - nx * head_half, hb.1 - ny * head_half),
-    ];
-    // the body ends inside the head, so that no seam shows between the two
-    let tb = (end.0 - ux * head_len * 0.8, end.1 - uy * head_len * 0.8);
-    let tail = [
-        start,
-        (tb.0 + nx * tail_half, tb.1 + ny * tail_half),
-        (tb.0 - nx * tail_half, tb.1 - ny * tail_half),
-    ];
-    Some([tail, head])
-}
-
-/// straight RGBA -> premultiplied (all channels in 0..=255 as f32)
-fn premul(p: [u8; 4]) -> [f32; 4] {
-    let a = p[3] as f32 / 255.;
-    [p[0] as f32 * a, p[1] as f32 * a, p[2] as f32 * a, p[3] as f32]
-}
-
-/// premultiplied -> straight RGBA; fully transparent pixels are always `[0, 0, 0, 0]`
-fn unpremul(p: [f32; 4]) -> [u8; 4] {
-    let a = p[3].clamp(0., 255.);
-    if a < 0.5 {
-        return [0, 0, 0, 0];
-    }
-    let k = 255. / a;
-    let q = |v: f32| (v * k).round().clamp(0., 255.) as u8;
-    [q(p[0]), q(p[1]), q(p[2]), a.round() as u8]
-}
-
-/// Interpolate from `from` to `to` by `c` (0..=255) in premultiplied space.
-/// With an opaque `to` this is "source over"; with a transparent `to` it erases.
-fn mix_px(from: [u8; 4], to: [u8; 4], c: u32) -> [u8; 4] {
-    if from[3] == 255 && to[3] == 255 {
-        let m = |f: u8, t: u8| ((f as u32 * (255 - c) + t as u32 * c + 127) / 255) as u8;
-        return [m(from[0], to[0]), m(from[1], to[1]), m(from[2], to[2]), 0xff];
-    }
-    let (f, t) = (premul(from), premul(to));
-    let k = c as f32 / 255.;
-    unpremul(std::array::from_fn(|i| f[i] + (t[i] - f[i]) * k))
-}
-
-/// Porter-Duff "source over" for straight RGBA pixels.
-fn over(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
-    match src[3] {
-        255 => return src,
-        0 => return dst,
-        _ => {}
-    }
-    let (s, d) = (premul(src), premul(dst));
-    let k = 1. - src[3] as f32 / 255.;
-    unpremul(std::array::from_fn(|i| s[i] + d[i] * k))
-}
-
-/// Antialiasing coverage of the current stroke or shape (0..=255 per pixel).
-struct Coverage {
-    width: usize,
-    height: usize,
-    data: Vec<u8>,
-    dirty: Option<Rect>,
-}
-impl Coverage {
-    fn new(width: usize, height: usize) -> Self {
-        Self { width, height, data: vec![0; width * height], dirty: None }
-    }
-
-    /// Resize if necessary, and clear only the modified region from the previous stroke.
-    fn prepare(&mut self, width: usize, height: usize) {
-        if self.width != width || self.height != height || self.data.len() != width * height {
-            self.width = width;
-            self.height = height;
-            self.data.resize(width * height, 0);
-            self.data.fill(0);
-            self.dirty = None;
-        } else if let Some(rect) = self.dirty.take() {
-            self.clear_rect(rect);
-        }
-    }
-
-    fn clear_all(&mut self) {
-        if let Some(rect) = self.dirty.take() {
-            self.clear_rect(rect);
-        }
-    }
-
-    fn mark_dirty(&mut self, rect: Rect) {
-        if rect.0 >= rect.2 || rect.1 >= rect.3 {
-            return;
-        }
-        self.dirty = Some(match self.dirty {
-            Some(d) => union_rect(d, rect),
-            None => rect,
-        });
-    }
-
-    // clip a floating-point bounding box to the mask
-    fn clip(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
-        (
-            (x0.floor() as i32).max(0),
-            (y0.floor() as i32).max(0),
-            (x1.ceil() as i32).min(self.width as i32),
-            (y1.ceil() as i32).min(self.height as i32),
-        )
-    }
-
-    fn clear_rect(&mut self, rect: Rect) {
-        let x0 = rect.0.max(0) as usize;
-        let y0 = rect.1.max(0) as usize;
-        let x1 = rect.2.clamp(0, self.width as i32) as usize;
-        let y1 = rect.3.clamp(0, self.height as i32) as usize;
-        if x0 >= x1 || y0 >= y1 {
-            return;
-        }
-        for y in y0..y1 {
-            self.data[y * self.width + x0..y * self.width + x1].fill(0);
-        }
-    }
-
-    // keep the larger coverage when shapes overlap, so overlaps never get darker
-    fn put(&mut self, x: i32, y: i32, value: f32) {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
-            return;
-        }
-        let v = (value.clamp(0., 1.) * 255.).round() as u8;
-        let i = y as usize * self.width + x as usize;
-        if v > self.data[i] {
-            self.data[i] = v;
-        }
-    }
-
-    /// A line segment with round caps; the line width is `2 * radius`.
-    fn add_capsule(&mut self, a: (f32, f32), b: (f32, f32), radius: f32) -> Rect {
-        let rect = self.clip(
-            a.0.min(b.0) - radius - 1.,
-            a.1.min(b.1) - radius - 1.,
-            a.0.max(b.0) + radius + 1.,
-            a.1.max(b.1) + radius + 1.,
-        );
-        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-        let len2 = dx * dx + dy * dy;
-        for y in rect.1..rect.3 {
-            for x in rect.0..rect.2 {
-                let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-                // distance from the pixel center to the segment
-                let t = if len2 > 0. {
-                    (((fx - a.0) * dx + (fy - a.1) * dy) / len2).clamp(0., 1.)
-                } else {
-                    0.
-                };
-                let (qx, qy) = (a.0 + t * dx, a.1 + t * dy);
-                let d = ((fx - qx).powi(2) + (fy - qy).powi(2)).sqrt();
-                self.put(x, y, radius + 0.5 - d);
-            }
-        }
-        self.mark_dirty(rect);
-        rect
-    }
-
-    /// Ellipse outline, drawn as a chain of short capsules.
-    fn add_ellipse_outline(&mut self, cx: f32, cy: f32, a: f32, b: f32, radius: f32) -> Rect {
-        let steps = ((a.max(b) * 6.) as usize).max(24);
-        let mut prev = (cx + a, cy);
-        let mut rect: Option<Rect> = None;
-        for i in 1..=steps {
-            let theta = i as f32 / steps as f32 * std::f32::consts::TAU;
-            let p = (cx + a * theta.cos(), cy + b * theta.sin());
-            let r = self.add_capsule(prev, p, radius);
-            rect = Some(rect.map_or(r, |u| union_rect(u, r)));
-            prev = p;
-        }
-        let rect = rect.unwrap_or((0, 0, 0, 0));
-        self.mark_dirty(rect);
-        rect
-    }
-
-    /// Filled ellipse; the edge coverage comes from an approximate distance to the boundary.
-    fn add_ellipse_fill(&mut self, cx: f32, cy: f32, a: f32, b: f32) -> Rect {
-        let (a, b) = (a.max(0.5), b.max(0.5));
-        let rect = self.clip(cx - a - 1., cy - b - 1., cx + a + 1., cy + b + 1.);
-        for y in rect.1..rect.3 {
-            for x in rect.0..rect.2 {
-                let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
-                let f = dx * dx / (a * a) + dy * dy / (b * b);
-                let (gx, gy) = (dx / (a * a), dy / (b * b));
-                let grad = 2. * (gx * gx + gy * gy).sqrt();
-                // signed distance (negative inside)
-                let d = if grad > 1e-6 { (f - 1.) / grad } else { -1.0e3 };
-                self.put(x, y, 0.5 - d);
-            }
-        }
-        self.mark_dirty(rect);
-        rect
-    }
-
-    /// Filled triangle with an antialiased edge.
-    fn add_triangle(&mut self, tri: &[Pt; 3]) -> Rect {
-        let (min_x, min_y, max_x, max_y) = triangle_bounds(tri);
-        let rect = self.clip(min_x - 1., min_y - 1., max_x + 1., max_y + 1.);
-        for y in rect.1..rect.3 {
-            for x in rect.0..rect.2 {
-                let d = triangle_distance(tri, (x as f32 + 0.5, y as f32 + 0.5));
-                self.put(x, y, 0.5 - d);
-            }
-        }
-        self.mark_dirty(rect);
-        rect
-    }
-}
-
-/// An opaque RGBA pixel map: the source of truth of the document.
-/// It tracks the bounding box of modified pixels so that history entries stay small.
-#[derive(Clone)]
-struct Pixmap {
-    width: usize,
-    height: usize,
-    pixels: Vec<[u8; 4]>,
-    // modified area since the last history entry: (x0, y0, x1, y1), end-exclusive
-    dirty: Option<Rect>,
-}
-
-impl Pixmap {
-    fn new(width: usize, height: usize, fill: [u8; 4]) -> Self {
-        Self { width, height, pixels: vec![fill; width * height], dirty: None }
-    }
-    fn from_image(img: image::RgbaImage) -> Self {
-        let (width, height) = (img.width() as usize, img.height() as usize);
-        let pixels = img.pixels()
-            .map(|p| if p[3] == 0 { [0, 0, 0, 0] } else { [p[0], p[1], p[2], p[3]] })
-            .collect();
-        Self { width, height, pixels, dirty: None }
-    }
-    // grow the dirty area; the given rectangle must already be clipped to the pixel map
-    fn mark(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
-        if x0 >= x1 || y0 >= y1 {
-            return;
-        }
-        self.dirty = Some(match self.dirty {
-            Some((a, b, c, d)) => (a.min(x0), b.min(y0), c.max(x1), d.max(y1)),
-            None => (x0, y0, x1, y1),
-        });
-    }
-
-    fn get(&self, x: i32, y: i32) -> Option<[u8; 4]> {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
-            return None;
-        }
-        Some(self.pixels[y as usize * self.width + x as usize])
-    }
-
-    fn set(&mut self, x: i32, y: i32, color: [u8; 4]) {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
-            return;
-        }
-        self.pixels[y as usize * self.width + x as usize] = color;
-        self.mark(x, y, x + 1, y + 1);
-    }
-
-    /// Fill a rectangle, clipped to the pixel map.
-    fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: [u8; 4]) {
-        let x0 = x.max(0);
-        let y0 = y.max(0);
-        let x1 = (x + w).min(self.width as i32);
-        let y1 = (y + h).min(self.height as i32);
-        if x0 >= x1 || y0 >= y1 {
-            return;
-        }
-        for yy in y0..y1 {
-            let row = yy as usize * self.width;
-            self.pixels[row + x0 as usize..row + x1 as usize].fill(color);
-        }
-        self.mark(x0, y0, x1, y1);
-    }
-
-    /// Paint a square brush of `size` pixels centered on (cx, cy).
-    fn stamp(&mut self, cx: i32, cy: i32, size: i32, color: [u8; 4]) {
-        self.fill_rect(cx - size / 2, cy - size / 2, size, size, color);
-    }
-
-    /// Draw a line with Bresenham's algorithm, stamping the brush at every step.
-    fn line(&mut self, from: (i32, i32), to: (i32, i32), size: i32, color: [u8; 4]) {
-        let (mut x0, mut y0) = from;
-        let (x1, y1) = to;
-        let dx = (x1 - x0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let dy = -(y1 - y0).abs();
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-        loop {
-            self.stamp(x0, y0, size, color);
-            if x0 == x1 && y0 == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y0 += sy;
-            }
-        }
-    }
-
-    /// Rectangle between two inclusive corners.
-    fn rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, size: i32, filled: bool, color: [u8; 4]) {
-        if filled {
-            self.fill_rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1, color);
-            return;
-        }
-        self.line((x0, y0), (x1, y0), size, color);
-        self.line((x1, y0), (x1, y1), size, color);
-        self.line((x1, y1), (x0, y1), size, color);
-        self.line((x0, y1), (x0, y0), size, color);
-    }
-
-    /// Ellipse inscribed in the rectangle between two inclusive corners.
-    fn ellipse(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, size: i32, filled: bool, color: [u8; 4]) {
-        let cx = (x0 + x1) as f32 / 2.;
-        let cy = (y0 + y1) as f32 / 2.;
-        let a  = (x1 - x0) as f32 / 2.;
-        let b  = (y1 - y0) as f32 / 2.;
-
-        if filled {
-            // one span per row
-            for y in y0..=y1 {
-                let t = if b > 0. { (y as f32 - cy) / b } else { 0. };
-                let half = a * (1. - t * t).max(0.).sqrt();
-                let left = (cx - half).round() as i32;
-                let right = (cx + half).round() as i32;
-                self.fill_rect(left, y, right - left + 1, 1, color);
-            }
-            return;
-        }
-
-        // sample the outline densely and connect the samples with lines, so no gaps remain
-        let steps = ((a.max(b) * 4.) as usize).max(16);
-        let mut prev: Option<(i32, i32)> = None;
-        for i in 0..=steps {
-            let theta = i as f32 / steps as f32 * std::f32::consts::TAU;
-            let p = ((cx + a * theta.cos()).round() as i32, (cy + b * theta.sin()).round() as i32);
-            match prev {
-                Some(q) if q != p => self.line(q, p, size, color),
-                None => self.stamp(p.0, p.1, size, color),
-                _ => {}
-            }
-            prev = Some(p);
-        }
-    }
-
-    /// Fill a triangle (pixels whose center is inside), clipped to the pixel map.
-    fn fill_triangle(&mut self, tri: &[Pt; 3], color: [u8; 4]) {
-        let (min_x, min_y, max_x, max_y) = triangle_bounds(tri);
-        let x0 = (min_x.floor() as i32).max(0);
-        let y0 = (min_y.floor() as i32).max(0);
-        let x1 = (max_x.ceil() as i32).min(self.width as i32);
-        let y1 = (max_y.ceil() as i32).min(self.height as i32);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                if triangle_distance(tri, (x as f32 + 0.5, y as f32 + 0.5)) <= 0. {
-                    self.set(x, y, color);
-                }
-            }
-        }
-    }
-
-    /// Arrow from `start` to `end` (see `arrow_triangles`), without antialiasing.
-    fn arrow(&mut self, start: (i32, i32), end: (i32, i32), size: i32, color: [u8; 4]) {
-        let Some(tris) = arrow_triangles(pixel_center(start), pixel_center(end), size as f32) else {
-            return;
-        };
-        for tri in &tris {
-            self.fill_triangle(tri, color);
-        }
-    }
-
-    /// Scanline flood fill (4-connected) that replaces the region of the clicked color.
-    /// With `smooth_edges`, the antialiased pixels around the region are recolored too.
-    fn flood_fill(&mut self, x: i32, y: i32, color: [u8; 4], smooth_edges: bool) {
-        let Some(target) = self.get(x, y) else { return };
-        if target == color {
-            return;
-        }
-
-        let w = self.width;
-        let height = self.height as i32;
-        // 0 = unvisited, 1 = filled region, 2 = edge visited
-        let mut visited = vec![0u8; w * self.height];
-        let mut spans: Vec<(i32, i32, i32)> = Vec::new(); // (y, left, right), inclusive
-
-        let mut stack = vec![(x, y)];
-        while let Some((x, y)) = stack.pop() {
-            if self.get(x, y) != Some(target) || visited[y as usize * w + x as usize] != 0 {
-                continue;
-            }
-            // extend the span to the left and right
-            let mut left = x;
-            while self.get(left - 1, y) == Some(target) {
-                left -= 1;
-            }
-            let mut right = x;
-            while self.get(right + 1, y) == Some(target) {
-                right += 1;
-            }
-            let row_offset = y as usize * w;
-            for i in left..=right {
-                visited[row_offset + i as usize] = 1;
-            }
-            spans.push((y, left, right));
-
-            // queue one seed per run of target pixels in the rows above and below
-            for ny in [y - 1, y + 1] {
-                if ny < 0 || ny >= height {
-                    continue;
-                }
-                let mut inside = false;
-                let nrow_offset = ny as usize * w;
-                for i in left..=right {
-                    let matches = self.get(i, ny) == Some(target) && visited[nrow_offset + i as usize] == 0;
-                    if matches && !inside {
-                        stack.push((i, ny));
-                    }
-                    inside = matches;
-                }
-            }
-        }
-
-        // antialiased pixels touching the region (8-neighborhood) get their share of the
-        // old color replaced, instead of being left behind as a halo
-        let mut edges: Vec<(i32, i32, [u8; 4])> = Vec::new();
-        if smooth_edges {
-            for &(y, left, right) in &spans {
-                // left and right neighbors on the same row
-                for nx in [left - 1, right + 1] {
-                    if nx >= 0 && nx < w as i32 {
-                        let i = y as usize * w + nx as usize;
-                        if visited[i] == 0 {
-                            visited[i] = 2;
-                            if let Some(c) = self.blend_edge(nx, y, target, color) {
-                                edges.push((nx, y, c));
-                            }
-                        }
-                    }
-                }
-
-                // rows above and below: scan from left - 1 to right + 1
-                for ny in [y - 1, y + 1] {
-                    if ny < 0 || ny >= height {
-                        continue;
-                    }
-                    let nrow_offset = ny as usize * w;
-                    let x0 = (left - 1).max(0) as usize;
-                    let x1 = ((right + 1).min(w as i32 - 1) + 1) as usize;
-                    for nx in x0..x1 {
-                        if visited[nrow_offset + nx] == 0 {
-                            visited[nrow_offset + nx] = 2;
-                            if let Some(c) = self.blend_edge(nx as i32, ny, target, color) {
-                                edges.push((nx as i32, ny, c));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut min_x = i32::MAX;
-        let mut min_y = i32::MAX;
-        let mut max_x = i32::MIN;
-        let mut max_y = i32::MIN;
-
-        for &(y, left, right) in &spans {
-            let x0 = left.max(0);
-            let x1 = (right + 1).min(w as i32);
-            if x0 < x1 {
-                let row = y as usize * w;
-                self.pixels[row + x0 as usize..row + x1 as usize].fill(color);
-                min_x = min_x.min(x0);
-                max_x = max_x.max(x1);
-                min_y = min_y.min(y);
-                max_y = max_y.max(y + 1);
-            }
-        }
-        for (x, y, c) in edges {
-            let i = y as usize * w + x as usize;
-            self.pixels[i] = c;
-            min_x = min_x.min(x);
-            max_x = max_x.max(x + 1);
-            min_y = min_y.min(y);
-            max_y = max_y.max(y + 1);
-        }
-        if min_x < max_x && min_y < max_y {
-            self.mark(min_x, min_y, max_x, max_y);
-        }
-    }
-
-    fn blend_edge(&self, x: i32, y: i32, target: [u8; 4], color: [u8; 4]) -> Option<[u8; 4]> {
-        let c = self.get(x, y)?;
-        if c == target {
-            return None; // not connected to the region, so leave it alone
-        }
-        // work in premultiplied space so that antialiased edges against a
-        // transparent background are handled correctly
-        let (t, col, pc) = (premul(target), premul(color), premul(c));
-        let dist2 = |p: [f32; 4]| -> f32 { (0..4).map(|k| (p[k] - t[k]).powi(2)).sum() };
-        // the most distant color nearby stands in for the line color
-        let mut line = pc;
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                if let Some(n) = self.get(x + dx, y + dy) {
-                    let n = premul(n);
-                    if dist2(n) > dist2(line) {
-                        line = n;
-                    }
-                }
-            }
-        }
-        let d: [f32; 4] = std::array::from_fn(|k| line[k] - t[k]);
-        let len2: f32 = d.iter().map(|v| v * v).sum();
-        if len2 < 1e-6 {
-            return None;
-        }
-        // share of the line color in this pixel (1.0 = solid line)
-        let a = ((0..4).map(|k| (pc[k] - t[k]) * d[k]).sum::<f32>() / len2).clamp(0., 1.);
-        Some(unpremul(std::array::from_fn(|k| pc[k] + (1. - a) * (col[k] - t[k]))))
-    }
-
-    /// Pixelate a rectangle: every `block`-sized cell is replaced by its average color.
-    /// Cells are anchored at the top-left of the rectangle, and the averaging is done in
-    /// premultiplied space so that transparent pixels do not darken the result.
-    fn mosaic(&mut self, x: i32, y: i32, w: i32, h: i32, block: i32) {
-        let x0 = x.max(0);
-        let y0 = y.max(0);
-        let x1 = (x + w).min(self.width as i32);
-        let y1 = (y + h).min(self.height as i32);
-        if x0 >= x1 || y0 >= y1 {
-            return;
-        }
-        let block = block.max(1);
-
-        let mut by = y0;
-        while by < y1 {
-            let by_end = (by + block).min(y1);
-            let mut bx = x0;
-            while bx < x1 {
-                let bx_end = (bx + block).min(x1);
-
-                // average of the cell
-                let mut sum = [0f32; 4];
-                for yy in by..by_end {
-                    let row = yy as usize * self.width;
-                    for xx in bx..bx_end {
-                        let p = premul(self.pixels[row + xx as usize]);
-                        for k in 0..4 {
-                            sum[k] += p[k];
-                        }
-                    }
-                }
-                let n = ((bx_end - bx) * (by_end - by)) as f32;
-                let avg = unpremul(sum.map(|v| v / n));
-
-                // fill the cell
-                for yy in by..by_end {
-                    let row = yy as usize * self.width;
-                    self.pixels[row + bx as usize..row + bx_end as usize].fill(avg);
-                }
-                bx = bx_end;
-            }
-            by = by_end;
-        }
-        self.mark(x0, y0, x1, y1);
-    }
-
-    /// Copy a rectangle into a new pixel map (pixels outside of this pixel map become background).
-    fn copy_region(&self, x: i32, y: i32, w: i32, h: i32) -> Pixmap {
-        let mut out = Pixmap::new(w.max(1) as usize, h.max(1) as usize, BACKGROUND);
-        for yy in 0..h {
-            for xx in 0..w {
-                if let Some(p) = self.get(x + xx, y + yy) {
-                    out.pixels[yy as usize * out.width + xx as usize] = p;
-                }
-            }
-        }
-        out
-    }
-
-    /// Overwrite a part of this pixel map with `src` placed at (x, y), clipped.
-    fn paste(&mut self, src: &Pixmap, x: i32, y: i32) {
-        for sy in 0..src.height as i32 {
-            let dy = y + sy;
-            if dy < 0 || dy >= self.height as i32 {
-                continue;
-            }
-            for sx in 0..src.width as i32 {
-                let dx = x + sx;
-                if dx < 0 || dx >= self.width as i32 {
-                    continue;
-                }
-                let i = dy as usize * self.width + dx as usize;
-                self.pixels[i] = over(src.pixels[sy as usize * src.width + sx as usize], self.pixels[i]);
-            }
-        }
-        self.mark(
-            x.max(0),
-            y.max(0),
-            (x + src.width as i32).min(self.width as i32),
-            (y + src.height as i32).min(self.height as i32),
-        );
-    }
-
-    /// Restore a rectangle from `src` (a pixel map of the same size), clipped.
-    fn restore_region(&mut self, src: &Pixmap, rect: Rect) {
-        let x0 = rect.0.max(0);
-        let y0 = rect.1.max(0);
-        let x1 = rect.2.min(self.width as i32);
-        let y1 = rect.3.min(self.height as i32);
-        if x0 >= x1 || y0 >= y1 {
-            return;
-        }
-        for y in y0..y1 {
-            let row = y as usize * self.width;
-            let range = row + x0 as usize..row + x1 as usize;
-            self.pixels[range.clone()].copy_from_slice(&src.pixels[range]);
-        }
-        self.mark(x0, y0, x1, y1);
-    }
-
-    /// Set the pixels of `rect` to the backup mixed with `color` by the coverage.
-    fn composite(&mut self, backup: &Pixmap, cov: &Coverage, color: [u8; 4], rect: Rect) {
-        let x0 = rect.0.max(0);
-        let y0 = rect.1.max(0);
-        let x1 = rect.2.min(self.width as i32);
-        let y1 = rect.3.min(self.height as i32);
-        if x0 >= x1 || y0 >= y1 {
-            return;
-        }
-        for y in y0..y1 {
-            let row = y as usize * self.width;
-            for x in x0..x1 {
-                let i = row + x as usize;
-                let c = cov.data[i] as u32;
-                let b = backup.pixels[i];
-                self.pixels[i] = match c {
-                    0 => b,
-                    255 => color,
-                    _ => mix_px(b, color, c),
-                };
-            }
-        }
-        self.mark(x0, y0, x1, y1);
-    }
-
-    // history helpers: these do not touch the dirty area
-    fn read_region(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<[u8; 4]> {
-        let mut out = Vec::with_capacity(w * h);
-        for yy in y..y + h {
-            let row = yy * self.width;
-            out.extend_from_slice(&self.pixels[row + x..row + x + w]);
-        }
-        out
-    }
-
-    fn write_region(&mut self, x: usize, y: usize, w: usize, h: usize, data: &[[u8; 4]]) {
-        for (i, yy) in (y..y + h).enumerate() {
-            let row = yy * self.width;
-            self.pixels[row + x..row + x + w].copy_from_slice(&data[i * w..(i + 1) * w]);
-        }
-    }
-
-}
-
-/// One undo step. A patch stores only the changed rectangle.
-enum Edit {
-    Patch {
-        x: usize,
-        y: usize,
-        w: usize,
-        h: usize,
-        before: Vec<[u8; 4]>,
-        after: Vec<[u8; 4]>,
-    },
-    // used when the canvas size changes
-    Replace {
-        before: Pixmap,
-        after: Pixmap,
-    },
-}
-
-/// A rectangular selection. The pixels are lifted ("floating") when the selection is first moved.
-struct Selection {
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    floating: Option<Pixmap>,
-}
-impl Selection {
-    fn contains(&self, p: (i32, i32)) -> bool {
-        p.0 >= self.x && p.0 < self.x + self.w && p.1 >= self.y && p.1 < self.y + self.h
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tool {
-    Pencil,
-    Eraser,
-    Fill,
-    Picker,
-    Line,
-    Rectangle,
-    Oval,
-    Text,
-    Arrow,
-    Mosaic,
-    Select,
-}
 
 /// What the current mouse drag is doing.
 #[derive(Clone, Copy)]
@@ -905,36 +113,17 @@ enum DiscardAction {
 }
 
 pub struct Application {
-    pixmap: Pixmap,
-    // the pixel map as of the last history entry, used to build patches
-    committed: Pixmap,
-    undo_stack: Vec<Edit>,
-    redo_stack: Vec<Edit>,
-    // undo depth of the saved (or freshly opened) document state;
-    // None when that state can no longer be reached with undo / redo
-    saved_depth: Option<usize>,
-    // file the document was opened from or last saved to (None = Untitled)
-    file_path: Option<PathBuf>,
+    doc: Document,
+    painter: Painter,
+    text: TextRenderer,
     // true while an async save dialog is pending
     is_saving: bool,
-    tool: Tool,
     drag: Drag,
     // last pixel touched while dragging (canvas coordinates)
     last_pos: (i32, i32),
-    brush_size: i32,
-    shape_filled: bool,
-    // anti-aliased drawing on/off, and the coverage of the stroke in progress (AA only)
-    antialias: bool,
-    coverage: Coverage,
-    active_aa: bool,
-    // shape preview: the pixel map before the shape and the area the preview covers
-    shape_backup: Option<Pixmap>,
-    shape_bounds: Option<Rect>,
-    selection: Option<Selection>,
     // whether the mouse pointer is over the selection (decides the pointer shape)
     over_selection: bool,    // pixel under the mouse pointer, if it is inside the canvas
     cursor_px: Option<(i32, i32)>,
-    current_color: [u8; 4],
     zoom_percent: f32,
     // how far the viewport is scrolled into the content, in logical pixels (>= 0)
     scroll: (f32, f32),
@@ -955,13 +144,6 @@ pub struct Application {
     xs_cache: Vec<i32>,
     ys_cache: Vec<i32>,
     focus_handle: FocusHandle,
-    // font
-    font_system: Option<cosmic_text::FontSystem>,
-    swash_cache: Option<cosmic_text::SwashCache>,
-    // installed font families (sorted, unique); built on first use
-    font_families: Vec<String>,
-    // font chosen last time in the text dialog
-    text_font: Option<String>,
     // keep subscriptions alive for the lifetime of the view
     _subscriptions: Vec<Subscription>,
 }
@@ -987,7 +169,7 @@ impl Application {
         let size_sub = cx.subscribe_in(&size_select, window, |this, _, ev, _, cx| {
                 if let SelectEvent::Confirm(Some(val)) = ev {
                     if let Ok(v) = val.parse::<i32>() {
-                        this.brush_size = v.clamp(1, 500);
+                        this.painter.brush_size = v.clamp(1, 500);
                         cx.notify();
                     }
                 }
@@ -1015,7 +197,7 @@ impl Application {
         let color_sub = cx.subscribe(&color_picker, |this, _, ev, cx| match ev {
             ColorPickerEvent::Change(color) => {
                 if let Some(color) = color {
-                    this.current_color = to_rgba8(*color);
+                    this.painter.color = to_rgba8(*color);
                     cx.notify();
                 }
             }
@@ -1037,8 +219,6 @@ impl Application {
                 cx.notify();
             }
         });
-
-        let pixmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND_WHITE);
 
         // follow the OS appearance (light / dark): apply it now and whenever it changes
         Theme::sync_system_appearance(Some(window), cx);
@@ -1064,27 +244,14 @@ impl Application {
         });
 
         let mut app = Self {
-            committed: pixmap.clone(),
-            pixmap,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
-            saved_depth: Some(0),
-            file_path: None,
+            doc: Document::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND_WHITE),
+            painter: Painter::new(initial_color),
+            text: TextRenderer::default(),
             is_saving: false,
-            tool: Tool::Pencil,
             drag: Drag::None,
             last_pos: (0, 0),
-            brush_size: 3,
-            shape_filled: false,
-            antialias: true,
-            coverage: Coverage::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1),
-            active_aa: false,
-            shape_backup: None,
-            shape_bounds: None,
-            selection: None,
             over_selection: false,
             cursor_px: None,
-            current_color: initial_color,
             zoom_percent: 100.,
             scroll: (0., 0.),
             size_select,
@@ -1100,10 +267,6 @@ impl Application {
             xs_cache: Vec::new(),
             ys_cache: Vec::new(),
             focus_handle: cx.focus_handle(),
-            font_system: None,
-            swash_cache: None,
-            font_families: Vec::new(),
-            text_font: None,
             _subscriptions: vec![color_sub, size_sub, zoom_sub, appearance_sub],
         };
         // give the canvas the keyboard focus at startup so that the shortcuts work at once
@@ -1157,8 +320,8 @@ impl Application {
         let view_w = f32::from(self.viewport_size.width);
         let view_h = f32::from(self.viewport_size.height);
         (
-            (self.pixmap.width as f32 * zoom + CANVAS_MARGIN * 2.).max(view_w),
-            (self.pixmap.height as f32 * zoom + CANVAS_MARGIN * 2.).max(view_h),
+            (self.doc.pixmap.width as f32 * zoom + CANVAS_MARGIN * 2.).max(view_w),
+            (self.doc.pixmap.height as f32 * zoom + CANVAS_MARGIN * 2.).max(view_h),
         )
     }
 
@@ -1227,8 +390,8 @@ impl Application {
         let zoom = self.zoom();
         let (content_w, content_h) = self.content_size(zoom);
         (
-            (content_w - self.pixmap.width as f32 * zoom) / 2. - self.scroll.0,
-            (content_h - self.pixmap.height as f32 * zoom) / 2. - self.scroll.1,
+            (content_w - self.doc.pixmap.width as f32 * zoom) / 2. - self.scroll.0,
+            (content_h - self.doc.pixmap.height as f32 * zoom) / 2. - self.scroll.1,
         )
     }
 
@@ -1256,8 +419,8 @@ impl Application {
 
         // choose the scroll so that the same canvas point stays under the anchor
         let (content_w, content_h) = self.content_size(new_zoom);
-        self.scroll.0 = (content_w - self.pixmap.width as f32 * new_zoom) / 2. - (anchor.0 - cx * new_zoom);
-        self.scroll.1 = (content_h - self.pixmap.height as f32 * new_zoom) / 2. - (anchor.1 - cy * new_zoom);
+        self.scroll.0 = (content_w - self.doc.pixmap.width as f32 * new_zoom) / 2. - (anchor.0 - cx * new_zoom);
+        self.scroll.1 = (content_h - self.doc.pixmap.height as f32 * new_zoom) / 2. - (anchor.1 - cy * new_zoom);
         self.clamp_scroll();
         self.mark_dirty();
     }
@@ -1266,7 +429,7 @@ impl Application {
     fn fit_to_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let avail_w = f32::from(self.viewport_size.width) - CANVAS_MARGIN * 2.;
         let avail_h = f32::from(self.viewport_size.height) - CANVAS_MARGIN * 2.;
-        let zoom = (avail_w / self.pixmap.width as f32).min(avail_h / self.pixmap.height as f32);
+        let zoom = (avail_w / self.doc.pixmap.width as f32).min(avail_h / self.doc.pixmap.height as f32);
         // round down to a whole percent so that the canvas is never cut off
         let percent = (zoom * 100.).floor().clamp(MIN_ZOOM_PERCENT, MAX_ZOOM_PERCENT);
         self.apply_zoom(percent);
@@ -1312,8 +475,8 @@ impl Application {
         let col_par: Vec<i32> = (0..w).map(|i| ((i as f32 + 0.5 - ox) / cell).floor() as i32 & 1).collect();
         let row_par: Vec<i32> = (0..h).map(|i| ((i as f32 + 0.5 - oy) / cell).floor() as i32 & 1).collect();
 
-        let bw = self.pixmap.width as i32;
-        let bh = self.pixmap.height as i32;
+        let bw = self.doc.pixmap.width as i32;
+        let bh = self.doc.pixmap.height as i32;
 
         self.xs_cache.clear();
         self.xs_cache.reserve(w);
@@ -1331,7 +494,7 @@ impl Application {
 
         // lifted selection pixels are drawn on top of the pixel map
         let floating = self
-            .selection
+            .doc.selection
             .as_ref()
             .and_then(|s| s.floating.as_ref().map(|f| (s.x, s.y, f)));
 
@@ -1353,7 +516,7 @@ impl Application {
                     continue;
                 }
 
-                let base = self.pixmap.pixels[cry as usize * self.pixmap.width + crx as usize];
+                let base = self.doc.pixmap.pixels[cry as usize * self.doc.pixmap.width + crx as usize];
                 let p = match floating {
                     Some((sx, sy, f))
                     if crx >= sx && crx < sx + f.width as i32 && cry >= sy && cry < sy + f.height as i32 =>
@@ -1388,7 +551,7 @@ impl Application {
         }
 
         // selection outline: a dashed black/white rectangle, one device pixel wide
-        if let Some(sel) = &self.selection {
+        if let Some(sel) = &self.doc.selection {
             let x0 = (ox + sel.x as f32 * zoom).round() as i32;
             let y0 = (oy + sel.y as f32 * zoom).round() as i32;
             let x1 = ((ox + (sel.x + sel.w) as f32 * zoom).round() as i32 - 1).max(x0);
@@ -1427,56 +590,6 @@ impl Application {
 
     // -- history -------------------------------------------------------------
 
-    /// true when the document differs from the saved state
-    fn is_modified(&self) -> bool {
-        // pixels that were lifted by a selection move are not in the history yet
-        let lifted = self.selection.as_ref().is_some_and(|s| s.floating.is_some());
-        lifted || self.saved_depth != Some(self.undo_stack.len())
-    }
-
-    fn push_edit(&mut self, edit: Edit) {
-        // a new edit discards the redo branch; if the saved state was inside it, it is lost
-        if self.saved_depth.is_some_and(|d| d > self.undo_stack.len()) {
-            self.saved_depth = None;
-        }
-        self.undo_stack.push(edit);
-        self.redo_stack.clear();
-        if self.undo_stack.len() > MAX_HISTORY {
-            self.undo_stack.remove(0);
-            // every depth moves down by one; the saved state is lost if it was the oldest one
-            self.saved_depth = self.saved_depth.and_then(|d| d.checked_sub(1));
-        }
-    }
-
-    // turn the pixels modified since the last entry into one undo step
-    fn record_history(&mut self) {
-        let Some((x0, y0, x1, y1)) = self.pixmap.dirty.take() else { return };
-        let (x, y, w, h) = (x0 as usize, y0 as usize, (x1 - x0) as usize, (y1 - y0) as usize);
-        let before = self.committed.read_region(x, y, w, h);
-        let after = self.pixmap.read_region(x, y, w, h);
-        if before == after {
-            return; // nothing actually changed
-        }
-        self.committed.write_region(x, y, w, h, &after);
-        self.push_edit(Edit::Patch { x, y, w, h, before, after });
-    }
-
-    fn apply_edit(&mut self, edit: &Edit, undo: bool) {
-        match edit {
-            Edit::Patch { x, y, w, h, before, after } => {
-                let data = if undo { before } else { after };
-                self.pixmap.write_region(*x, *y, *w, *h, data);
-                self.committed.write_region(*x, *y, *w, *h, data);
-            }
-            Edit::Replace { before, after } => {
-                let target = if undo { before } else { after };
-                self.pixmap = target.clone();
-                self.committed = target.clone();
-            }
-        }
-        self.pixmap.dirty = None;
-    }
-
     fn after_history_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_size_inputs(window, cx);
         self.clamp_scroll();
@@ -1485,50 +598,36 @@ impl Application {
     }
 
     fn undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // flatten a floating selection first, so that undo cancels the move
-        self.commit_selection();
-        if let Some(edit) = self.undo_stack.pop() {
-            self.apply_edit(&edit, true);
-            self.redo_stack.push(edit);
+        let changed = self.doc.undo();
+        self.mark_dirty();
+        if changed {
             self.after_history_change(window, cx);
+        } else {
+            cx.notify(); // a floating selection may have been flattened
         }
     }
 
     fn redo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.commit_selection();
-        if let Some(edit) = self.redo_stack.pop() {
-            self.apply_edit(&edit, false);
-            self.undo_stack.push(edit);
+        let changed = self.doc.redo();
+        self.mark_dirty();
+        if changed {
             self.after_history_change(window, cx);
+        } else {
+            cx.notify();
         }
     }
 
     // replace the whole pixel map (resize / open); `record` makes it undoable
     fn replace_pixmap(&mut self, new_pixmap: Pixmap, record: bool) {
-        self.selection = None;
         self.drag = Drag::None;
-        if record {
-            self.record_history();
-            let before = std::mem::replace(&mut self.committed, new_pixmap.clone());
-            self.push_edit(Edit::Replace { before, after: new_pixmap.clone() });
-        } else {
-            self.committed = new_pixmap.clone();
-            self.undo_stack.clear();
-            self.redo_stack.clear();
-            self.saved_depth = Some(0);
-        }
-        self.pixmap = new_pixmap;
+        self.doc.replace_pixmap(new_pixmap, record);
     }
 
     // -- selection -----------------------------------------------------------
 
     // flatten the selection into the pixel map (a no-op if the pixels were never lifted)
     fn commit_selection(&mut self) {
-        let Some(sel) = self.selection.take() else { return };
-        if let Some(floating) = sel.floating {
-            self.pixmap.paste(&floating, sel.x, sel.y);
-            self.record_history();
-        }
+        self.doc.commit_selection();
         self.mark_dirty();
     }
 
@@ -1538,27 +637,14 @@ impl Application {
         if !matches!(self.drag, Drag::None) {
             return;
         }
-        // flatten the current selection first, so that moved pixels are not lost
-        self.commit_selection();
-        self.tool = Tool::Select;
-        self.selection = Some(Selection {
-            x: 0,
-            y: 0,
-            w: self.pixmap.width as i32,
-            h: self.pixmap.height as i32,
-            floating: None,
-        });
+        self.doc.select_all();
+        self.painter.tool = Tool::Select;
         self.mark_dirty();
         cx.notify();
     }
 
     fn delete_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(sel) = self.selection.take() else { return };
-        // lifted pixels already left a hole behind, so only an unlifted selection needs clearing
-        if sel.floating.is_none() {
-            self.pixmap.fill_rect(sel.x, sel.y, sel.w, sel.h, BACKGROUND);
-        }
-        self.record_history();
+        self.doc.delete_selection();
         self.mark_dirty();
         cx.notify();
     }
@@ -1574,39 +660,18 @@ impl Application {
         cx.notify();
     }
 
-    fn update_selection(&mut self, start: (i32, i32), end: (i32, i32)) {
-        let max_x = self.pixmap.width as i32 - 1;
-        let max_y = self.pixmap.height as i32 - 1;
-        let clamp = |p: (i32, i32)| (p.0.clamp(0, max_x), p.1.clamp(0, max_y));
-        let (s, e) = (clamp(start), clamp(end));
-        self.selection = Some(Selection {
-            x: s.0.min(e.0),
-            y: s.1.min(e.1),
-            w: (s.0 - e.0).abs() + 1,
-            h: (s.1 - e.1).abs() + 1,
-            floating: None,
-        });
-    }
-
     // copy the selection to the system clipboard as an image
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(sel) = &self.selection else { return };
-        // lifted pixels live in the selection, otherwise read them from the pixel map
-        let region = match &sel.floating {
-            Some(floating) => floating.clone(),
-            None => self.pixmap.copy_region(sel.x, sel.y, sel.w, sel.h),
-        };
-        let bytes: Vec<u8> = region.pixels.iter().flatten().copied().collect();
-        let Some(buffer) = image::RgbaImage::from_raw(region.width as u32, region.height as u32, bytes) else {
-            return;
-        };
+        let Some(region) = self.doc.selection_pixmap() else { return };
 
         // encode as PNG and put it on the clipboard through gpui
-        let mut png = Vec::new();
-        if let Err(e) = buffer.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png) {
-            show_error(&t!("error.encode_image", error = e));
-            return;
-        }
+        let png = match region.to_png() {
+            Ok(png) => png,
+            Err(e) => {
+                show_error(&image_error_message(&e));
+                return;
+            }
+        };
 
         // Windows: write CF_DIB directly so that every app can paste the image;
         // fall back to gpui when the native path fails
@@ -1667,10 +732,10 @@ impl Application {
         self.commit_selection();
 
         // grow the canvas when the image does not fit (undoable)
-        if w > self.pixmap.width || h > self.pixmap.height {
-            let (old_w, old_h) = (self.pixmap.width, self.pixmap.height);
+        if w > self.doc.pixmap.width || h > self.doc.pixmap.height {
+            let (old_w, old_h) = (self.doc.pixmap.width, self.doc.pixmap.height);
             let mut grown = Pixmap::new(w.max(old_w), h.max(old_h), BACKGROUND);
-            let data = self.pixmap.read_region(0, 0, old_w, old_h);
+            let data = self.doc.pixmap.read_region(0, 0, old_w, old_h);
             grown.write_region(0, 0, old_w, old_h, &data);
             self.replace_pixmap(grown, true);
             self.sync_size_inputs(window, cx);
@@ -1686,7 +751,7 @@ impl Application {
         let view_h = f32::from(self.viewport_size.height) - if bar_x.is_some() { SCROLLBAR_SIZE } else { 0. };
         let (ox, oy) = self.canvas_origin();
         let zoom = self.zoom();
-        let (bw, bh) = (self.pixmap.width as i32, self.pixmap.height as i32);
+        let (bw, bh) = (self.doc.pixmap.width as i32, self.doc.pixmap.height as i32);
         let vx0 = ((-ox / zoom).ceil() as i32).clamp(0, bw);
         let vy0 = ((-oy / zoom).ceil() as i32).clamp(0, bh);
         let vx1 = (((view_w - ox) / zoom).floor() as i32).clamp(vx0, bw);
@@ -1702,22 +767,15 @@ impl Application {
         let x = place(vx0, vx1, w as i32, bw - w as i32);
         let y = place(vy0, vy1, h as i32, bh - h as i32);
 
-        self.tool = Tool::Select;
-        self.selection = Some(Selection { x, y, w: w as i32, h: h as i32, floating: Some(pasted) });
+        self.painter.tool = Tool::Select;
+        self.doc.selection = Some(Selection { x, y, w: w as i32, h: h as i32, floating: Some(pasted) });
         self.mark_dirty();
         cx.notify();
     }
 
     fn select_mouse_down(&mut self, p: (i32, i32)) {
-        let inside = self.selection.as_ref().is_some_and(|s| s.contains(p));
-        if inside {
-            let sel = self.selection.as_mut().unwrap();
-            // lift the pixels, leaving a background-colored hole
-            if sel.floating.is_none() {
-                sel.floating = Some(self.pixmap.copy_region(sel.x, sel.y, sel.w, sel.h));
-                self.pixmap.fill_rect(sel.x, sel.y, sel.w, sel.h, BACKGROUND);
-            }
-            self.drag = Drag::SelectMove { grab: (p.0 - sel.x, p.1 - sel.y) };
+        if let Some(grab) = self.doc.grab_selection(p) {
+            self.drag = Drag::SelectMove { grab };
         } else {
             self.commit_selection();
             self.drag = Drag::SelectNew { start: p };
@@ -1726,132 +784,10 @@ impl Application {
 
     // -- drawing -------------------------------------------------------------
 
-    // color used by the pencil-like tools
-    fn tool_color(&self) -> [u8; 4] {
-        match self.tool {
-            Tool::Eraser => BACKGROUND,
-            _ => self.current_color,
-        }
-    }
-
-    // draw (or redraw) the shape preview between two canvas pixels
-    fn draw_shape(&mut self, start: (i32, i32), end: (i32, i32)) {
-        let Some(backup) = self.shape_backup.as_ref() else { return };
-        // erase the previous preview
-        if let Some(bounds) = self.shape_bounds {
-            self.pixmap.restore_region(backup, bounds);
-            if self.active_aa {
-                self.coverage.clear_rect(bounds);
-            }
-        }
-
-        let color = self.tool_color();
-        let size = self.brush_size;
-        let (x0, x1) = (start.0.min(end.0), start.0.max(end.0));
-        let (y0, y1) = (start.1.min(end.1), start.1.max(end.1));
-        if self.active_aa {
-            let cov = &mut self.coverage;
-            // anti-aliased: build the coverage, then composite it over the original pixels
-            let r = size as f32 / 2.;
-            let touched: Option<Rect> = match self.tool {
-                Tool::Line => Some(cov.add_capsule(pixel_center(start), pixel_center(end), r)),
-                // a filled rectangle is pixel-aligned, so it needs no smoothing
-                Tool::Rectangle if self.shape_filled => {
-                    self.pixmap.rect(x0, y0, x1, y1, size, true, color);
-                    None
-                }
-                Tool::Rectangle => {
-                    let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
-                    let mut rect = cov.add_capsule(pixel_center(corners[0]), pixel_center(corners[1]), r);
-                    for i in 1..4 {
-                        let side = cov.add_capsule(
-                            pixel_center(corners[i]),
-                            pixel_center(corners[(i + 1) % 4]),
-                            r,
-                        );
-                        rect = union_rect(rect, side);
-                    }
-                    Some(rect)
-                }
-                Tool::Oval => {
-                    let cx = (x0 + x1) as f32 / 2. + 0.5;
-                    let cy = (y0 + y1) as f32 / 2. + 0.5;
-                    let a = (x1 - x0) as f32 / 2.;
-                    let b = (y1 - y0) as f32 / 2.;
-                    if self.shape_filled {
-                        Some(cov.add_ellipse_fill(cx, cy, a + 0.5, b + 0.5))
-                    } else {
-                        Some(cov.add_ellipse_outline(cx, cy, a, b, r))
-                    }
-                }
-                Tool::Arrow => {
-                    arrow_triangles(pixel_center(start), pixel_center(end), size as f32).map(|[tail, head]| {
-                        let r1 = cov.add_triangle(&tail);
-                        let r2 = cov.add_triangle(&head);
-                        union_rect(r1, r2)
-                    })
-                }
-                _ => None,
-            };
-            if let Some(rect) = touched {
-                self.pixmap.composite(backup, cov, color, rect);
-            }
-        } else {
-            match self.tool {
-                Tool::Line => self.pixmap.line(start, end, size, color),
-                Tool::Rectangle => self.pixmap.rect(x0, y0, x1, y1, size, self.shape_filled, color),
-                Tool::Oval => self.pixmap.ellipse(x0, y0, x1, y1, size, self.shape_filled, color),
-                Tool::Arrow => self.pixmap.arrow(start, end, size, color),
-                _ => {}
-            }
-        }
-        // the preview may extend beyond the corners by the brush size
-        // (an arrow head is wider than the brush)
-        let margin = if self.tool == Tool::Arrow { size * 3 + 2 } else { size };
-        self.shape_bounds = Some((x0 - margin, y0 - margin, x1 + margin + 1, y1 + margin + 1));
-    }
-
-    // collect the installed font families (once)
-    fn ensure_font_families(&mut self) {
-        if !self.font_families.is_empty() {
-            return;
-        }
-        let font_system = self.font_system.get_or_insert_with(cosmic_text::FontSystem::new);
-        let mut families: Vec<String> = font_system
-            .db()
-            .faces()
-            .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
-            // names starting with '.' are hidden system fonts (e.g. ".AI Bayan PUA" on macOS)
-            .filter(|name| !name.starts_with('.'))
-            .collect();
-        families.sort_by_key(|s| s.to_lowercase());
-        families.dedup();
-        if families.is_empty() {
-            families.push("sans-serif".to_string());
-        }
-        self.font_families = families;
-    }
-
-    // default font for the first use: the first installed font of a per-OS candidate list
-    fn default_font_family(&self) -> Option<String> {
-        const CANDIDATES: &[&str] = if cfg!(target_os = "macos") {
-            &["Hiragino Sans", "Helvetica Neue", "Helvetica", "Arial"]
-        } else if cfg!(windows) {
-            &["Yu Gothic UI", "Meiryo UI", "Segoe UI", "Arial"]
-        } else {
-            &["Noto Sans CJK JP", "Noto Sans", "DejaVu Sans", "Arial"]
-        };
-        CANDIDATES
-            .iter()
-            .find_map(|c| self.font_families.iter().find(|f| f.as_str() == *c))
-            .cloned()
-    }
-
     fn draw_text(&mut self, origin: (i32, i32), window: &mut Window, cx: &mut Context<Self>) {
-        self.ensure_font_families();
 
         let app = cx.entity();
-        let default_font_size = (self.brush_size * 8).clamp(12, 120);
+        let default_font_size = (self.painter.brush_size * 8).clamp(12, 120);
         let text_input = cx.new(|cx| InputState::new(window, cx).placeholder("Enter text..."));
         let font_size_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -1863,8 +799,8 @@ impl Application {
 
         // font select: preselect the font used last time,
         // or the system default (sans-serif) font on the first use
-        let preferred = self.text_font.clone().or_else(|| self.default_font_family());
-        let families = self.font_families.clone();
+        let families = self.text.families().to_vec();
+        let preferred = self.text.last_font.clone().or_else(|| self.text.default_family());
         let selected = preferred
             .as_ref()
             .and_then(|name| families.iter().position(|f| f == name))
@@ -1898,7 +834,7 @@ impl Application {
                     let family: Option<String> = font_select.read(cx).selected_value().cloned();
                     if !text.is_empty() {
                         app.update(cx, |this, cx| {
-                            this.text_font = family.clone();
+                            this.text.last_font = family.clone();
                             this.render_text(&text, font_size, family.as_deref(), origin, cx);
                         });
                     }
@@ -1980,72 +916,28 @@ impl Application {
         font_size: f32,
         family: Option<&str>,
         origin: (i32, i32),
-        cx: &mut Context<Self>
+        cx: &mut Context<Self>,
     ) {
-        let font_system = self.font_system.get_or_insert_with(cosmic_text::FontSystem::new);
-        let swash_cache = self.swash_cache.get_or_insert_with(cosmic_text::SwashCache::new);
-
-        let metrics = cosmic_text::Metrics::new(font_size, font_size * 1.25);
-        let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
-        let mut buffer = buffer.borrow_with(font_system);
-        let attrs = match family {
-            Some(name) => cosmic_text::Attrs::new().family(cosmic_text::Family::Name(name)),
-            None => cosmic_text::Attrs::new(),
-        };
-        buffer.set_text(text, &attrs, cosmic_text::Shaping::Advanced, None);
-        buffer.shape_until_scroll(false);
-
-        let color = self.current_color;
-        let cosmic_color = cosmic_text::Color::rgba(color[0], color[1], color[2], color[3]);
-
-        let antialias = self.antialias;
-        let bw = self.pixmap.width as i32;
-        let bh = self.pixmap.height as i32;
-
-        let mut drawn = false;
-        buffer.draw(swash_cache, cosmic_color, |x, y, _w, _h, pixel_color| {
-            let px = origin.0 + x;
-            let py = origin.1 + y;
-            if px < 0 || py < 0 || px >= bw || py >= bh {
-                return;
-            }
-            let a = pixel_color.a();
-            if a == 0 {
-                return;
-            }
-            let src = [pixel_color.r(), pixel_color.g(), pixel_color.b(), a];
-            if !antialias {
-                if a >= 128 {
-                    self.pixmap.set(px, py, [src[0], src[1], src[2], color[3]]);
-                    drawn = true;
-                }
-            } else if let Some(bg) = self.pixmap.get(px, py) {
-                self.pixmap.set(px, py, over(src, bg));
-                drawn = true;
-            }
-        });
-
+        let drawn = self.text.render(
+            &mut self.doc.pixmap,
+            text,
+            font_size,
+            family,
+            origin,
+            self.painter.color,
+            self.painter.antialias,
+        );
         if drawn {
-            self.record_history();
+            self.doc.record_history();
             self.mark_dirty();
             cx.notify();
         }
     }
 
-    // add a round-capped segment to the stroke's coverage and composite it over the saved pixels
-    fn aa_segment(&mut self, from: (i32, i32), to: (i32, i32), color: [u8; 4]) {
-        let Some(backup) = self.shape_backup.as_ref() else {
-            return;
-        };
-        let radius = self.brush_size as f32 / 2.;
-        let rect = self.coverage.add_capsule(pixel_center(from), pixel_center(to), radius);
-        self.pixmap.composite(backup, &self.coverage, color, rect);
-    }
-
     // -- canvas size ---------------------------------------------------------
 
     fn sync_size_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (width, height) = (self.pixmap.width, self.pixmap.height);
+        let (width, height) = (self.doc.pixmap.width, self.doc.pixmap.height);
         self.set_size_inputs(width, height, window, cx);
     }
 
@@ -2072,26 +964,19 @@ impl Application {
         // the trim origin is the top-left corner of the selection (the canvas origin if nothing is selected);
         // it is read before the selection is flattened, and only after validation succeeded,
         // so that a rejected input leaves the selection intact for the next try
-        let (ox, oy) = self.selection.as_ref().map_or((0, 0), |s| (s.x, s.y));
-        if (ox, oy) == (0, 0) && width == self.pixmap.width && height == self.pixmap.height {
+        if !self.doc.trim(width, height) {
             return false;
         }
-
-        // flatten a floating selection so that its pixels are part of the trimmed image
-        self.commit_selection();
-
-        // trim at (ox, oy); the part outside the current canvas becomes the background
-        let new_pixmap = self.pixmap.copy_region(ox, oy, width as i32, height as i32);
-
-        self.replace_pixmap(new_pixmap, true);
+        self.drag = Drag::None;
+        self.mark_dirty();
         self.after_history_change(window, cx);
         true
     }
 
     fn open_resize_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // show the selection size in the inputs, or the canvas size when nothing is selected
-        let trim = self.selection.is_some();
-        match self.selection.as_ref().map(|s| (s.w as usize, s.h as usize)) {
+        let trim = self.doc.selection.is_some();
+        match self.doc.selection.as_ref().map(|s| (s.w as usize, s.h as usize)) {
             Some((w, h)) => self.set_size_inputs(w, h, window, cx),
             None => self.sync_size_inputs(window, cx),
         }
@@ -2179,7 +1064,7 @@ impl Application {
         }
         self.focus_canvas(window, cx);
         let p = self.to_canvas_px(event.position);
-        let tool = self.tool;
+        let tool = self.painter.tool;
         // every tool except Select flattens an active selection first
         if tool != Tool::Select {
             self.commit_selection();
@@ -2188,54 +1073,37 @@ impl Application {
             Tool::Pencil | Tool::Eraser => {
                 self.drag = Drag::Draw;
                 self.last_pos = p;
-                let color = self.tool_color();
-                if self.antialias {
-                    // keep the pixels from before the stroke; the stroke is composited over them
-                    self.shape_backup = Some(self.pixmap.clone());
-                    self.coverage.prepare(self.pixmap.width, self.pixmap.height);
-                    self.active_aa = true;
-                    self.aa_segment(p, p, color);
-                } else {
-                    self.active_aa = false;
-                    self.pixmap.stamp(p.0, p.1, self.brush_size, color);
-                }
+                self.painter.begin_stroke(&mut self.doc.pixmap, p);
             }
             Tool::Fill => {
-                let color = self.current_color;
-                self.pixmap.flood_fill(p.0, p.1, color, self.antialias);
-                self.record_history();
+                self.painter.fill(&mut self.doc.pixmap, p);
+                self.doc.record_history();
             }
             Tool::Picker => {
-                if let Some(c) = self.pixmap.get(p.0, p.1) {
-                    self.current_color = c;
+                if let Some(c) = self.doc.pixmap.get(p.0, p.1) {
+                    self.painter.color = c;
                     let hsla = rgba_to_hsla(c);
                     // keep the picker's displayed color in sync (does not emit Change)
                     self.color_picker
                         .update(cx, |state, cx| state.set_value(hsla, window, cx));
                     // like classic Paint, go back to drawing after picking
-                    self.tool = Tool::Pencil;
+                    self.painter.tool = Tool::Pencil;
                 }
             }
             Tool::Line | Tool::Rectangle | Tool::Oval | Tool::Arrow => {
                 self.drag = Drag::Shape { start: p };
                 self.last_pos = p;
-                self.shape_backup = Some(self.pixmap.clone());
-                self.active_aa = self.antialias;
-                if self.active_aa {
-                    self.coverage.prepare(self.pixmap.width, self.pixmap.height);
-                }
-                self.shape_bounds = None;
-                self.draw_shape(p, p);
+                self.painter.begin_shape(&mut self.doc.pixmap, p);
             }
             Tool::Text => {
-                if self.pixmap.get(p.0, p.1).is_some() {
+                if self.doc.pixmap.get(p.0, p.1).is_some() {
                     self.draw_text(p, window, cx);
                 }
             }
             Tool::Mosaic => {
                 self.drag = Drag::MosaicNew { start: p };
                 // show the rectangle with the selection outline while dragging
-                self.update_selection(p, p);
+                self.doc.select_rect(p, p);
             }
             Tool::Select => self.select_mouse_down(p),
         }
@@ -2250,7 +1118,7 @@ impl Application {
         let p = self.to_canvas_px(event.position);
 
         // cursor position shown in the footer
-        let inside = p.0 >= 0 && p.1 >= 0 && p.0 < self.pixmap.width as i32 && p.1 < self.pixmap.height as i32;
+        let inside = p.0 >= 0 && p.1 >= 0 && p.0 < self.doc.pixmap.width as i32 && p.1 < self.doc.pixmap.height as i32;
         let cursor = inside.then_some(p);
         let mut changed = false;
         if cursor != self.cursor_px {
@@ -2259,7 +1127,7 @@ impl Application {
         }
         // the pointer shape depends on whether the pointer is over the selection
         // (only the Select tool can move it)
-        let over = self.tool == Tool::Select && self.selection.as_ref().is_some_and(|s| s.contains(p));
+        let over = self.painter.tool == Tool::Select && self.doc.selection.as_ref().is_some_and(|s| s.contains(p));
         if over != self.over_selection {
             self.over_selection = over;
             changed = true;
@@ -2268,12 +1136,7 @@ impl Application {
             Drag::None => {}
             Drag::Draw => {
                 if p != self.last_pos {
-                    let color = self.tool_color();
-                    if self.active_aa {
-                        self.aa_segment(self.last_pos, p, color);
-                    } else {
-                        self.pixmap.line(self.last_pos, p, self.brush_size, color);
-                    }
+                    self.painter.stroke_to(&mut self.doc.pixmap, self.last_pos, p);
                     self.last_pos = p;
                     self.mark_dirty();
                     changed = true;
@@ -2282,23 +1145,23 @@ impl Application {
             Drag::Shape { start } => {
                 if p != self.last_pos {
                     self.last_pos = p;
-                    self.draw_shape(start, p);
+                    self.painter.update_shape(&mut self.doc.pixmap, start, p);
                     self.mark_dirty();
                     changed = true;
                 }
             }
             Drag::MosaicNew { start } => {
-                self.update_selection(start, p);
+                self.doc.select_rect(start, p);
                 self.mark_dirty();
                 changed = true;
             }
             Drag::SelectNew { start } => {
-                self.update_selection(start, p);
+                self.doc.select_rect(start, p);
                 self.mark_dirty();
                 changed = true;
             }
             Drag::SelectMove { grab } => {
-                if let Some(sel) = self.selection.as_mut() {
+                if let Some(sel) = self.doc.selection.as_mut() {
                     sel.x = p.0 - grab.0;
                     sel.y = p.1 - grab.1;
                     self.mark_dirty();
@@ -2336,33 +1199,23 @@ impl Application {
             return;
         }
         match std::mem::replace(&mut self.drag, Drag::None) {
-            Drag::Draw => {
-                self.shape_backup = None;
-                self.coverage.clear_all();
-                self.active_aa = false;
-                self.record_history();
-            }
-            Drag::Shape { .. } => {
-                self.shape_backup = None;
-                self.shape_bounds = None;
-                self.coverage.clear_all();
-                self.active_aa = false;
-                self.record_history();
+            Drag::Draw | Drag::Shape { .. } => {
+                self.painter.finish();
+                self.doc.record_history();
             }
             Drag::MosaicNew { .. } => {
                 // apply the mosaic to the dragged rectangle; the rectangle is not kept as a selection
-                if let Some(sel) = self.selection.take() {
+                if let Some(sel) = self.doc.selection.take() {
                     if sel.w > 1 || sel.h > 1 {
-                        let block = self.brush_size * MOSAIC_BLOCK_FACTOR;
-                        self.pixmap.mosaic(sel.x, sel.y, sel.w, sel.h, block);
-                        self.record_history();
+                        self.painter.mosaic(&mut self.doc.pixmap, sel.x, sel.y, sel.w, sel.h);
+                        self.doc.record_history();
                     }
                 }
             }
             Drag::SelectNew { .. } => {
                 // a plain click (no drag) just clears the selection
-                if self.selection.as_ref().is_some_and(|s| s.w == 1 && s.h == 1) {
-                    self.selection = None;
+                if self.doc.selection.as_ref().is_some_and(|s| s.w == 1 && s.h == 1) {
+                    self.doc.selection = None;
                 }
             }
             _ => {}
@@ -2370,8 +1223,8 @@ impl Application {
 
         // the selection may have just been created, moved or cleared
         let p = self.to_canvas_px(event.position);
-        self.over_selection = self.tool == Tool::Select
-            && self.selection.as_ref().is_some_and(|s| s.contains(p));
+        self.over_selection = self.painter.tool == Tool::Select
+            && self.doc.selection.as_ref().is_some_and(|s| s.contains(p));
 
         self.mark_dirty();
         cx.notify();
@@ -2402,15 +1255,12 @@ impl Application {
     fn finish_drag(&mut self) {
         match std::mem::replace(&mut self.drag, Drag::None) {
             Drag::Draw | Drag::Shape { .. } => {
-                self.shape_backup = None;
-                self.shape_bounds = None;
-                self.coverage.clear_all();
-                self.active_aa = false;
-                self.record_history();
+                self.painter.finish();
+                self.doc.record_history();
             }
             // cancel an unfinished mosaic drag without applying it
             Drag::MosaicNew { .. } => {
-                self.selection = None;
+                self.doc.selection = None;
                 self.mark_dirty();
             }
             _ => {}
@@ -2511,16 +1361,16 @@ impl Application {
         }
         self.finish_drag();
         self.commit_selection();
-        if !self.is_modified() {
+        if !self.doc.is_modified() {
             return true;
         }
         let answer = confirm_unsaved();
         match answer {
             rfd::MessageDialogResult::Yes => {
-                let existing = self.file_path.clone().filter(|p| save_format(p).is_some());
+                let existing = self.doc.file_path.clone().filter(|p| save_format(p).is_some());
                 if let Some(path) = existing {
-                    let pixmap = self.pixmap.clone();
-                    let depth = self.undo_stack.len();
+                    let pixmap = self.doc.pixmap.clone();
+                    let depth = self.doc.undo_depth();
                     self.write_image_data(&pixmap, depth, path, cx)
                 } else {
                     self.save_image_on_close(cx);
@@ -2534,8 +1384,8 @@ impl Application {
 
     fn save_image_on_close(&mut self, cx: &mut Context<Self>) {
         let dialog = self.prepare_save_dialog();
-        let current_pixmap = self.pixmap.clone();
-        let current_depth = self.undo_stack.len();
+        let current_pixmap = self.doc.pixmap.clone();
+        let current_depth = self.doc.undo_depth();
         self.is_saving = true;
 
         cx.spawn(async move |this, cx| {
@@ -2569,7 +1419,7 @@ impl Application {
         }
         self.finish_drag();
         self.commit_selection();
-        if !self.is_modified() {
+        if !self.doc.is_modified() {
             self.perform_discard_action(action, window, cx);
             return;
         }
@@ -2595,21 +1445,20 @@ impl Application {
             DiscardAction::NewDocument => {
                 let pixmap = Pixmap::new(DEFAULT_CANVAS_SIZE.0, DEFAULT_CANVAS_SIZE.1, BACKGROUND_WHITE);
                 self.replace_pixmap(pixmap, false);
-                self.file_path = None;
+                self.doc.file_path = None;
                 self.scroll = (0., 0.);
                 self.after_history_change(window, cx);
             }
             DiscardAction::LoadImage(path) => {
-                let img = match image::open(&path) {
-                    Ok(img) => img.to_rgba8(),
+                let pixmap = match Pixmap::open(&path) {
+                    Ok(pixmap) => pixmap,
                     Err(e) => {
-                        show_error(&t!("error.open_image", error = e));
+                        show_error(&image_error_message(&e));
                         return;
                     }
                 };
-                let pixmap = Pixmap::from_image(img);
                 self.replace_pixmap(pixmap, false);
-                self.file_path = Some(path);
+                self.doc.file_path = Some(path);
                 self.scroll = (0., 0.);
                 self.after_history_change(window, cx);
             }
@@ -2625,7 +1474,7 @@ impl Application {
             .add_filter("TIFF image", &["tif", "tiff"])
             .add_filter("WebP image", &["webp"]);
 
-        match &self.file_path {
+        match &self.doc.file_path {
             Some(p) => {
                 let ext = if save_format(p).is_some() {
                     p.extension().map(|e| e.to_string_lossy().into_owned())
@@ -2659,10 +1508,10 @@ impl Application {
         self.finish_drag();
         self.commit_selection();
 
-        let existing = self.file_path.clone().filter(|p| !save_as && save_format(p).is_some());
+        let existing = self.doc.file_path.clone().filter(|p| !save_as && save_format(p).is_some());
         if let Some(path) = existing {
-            let pixmap = self.pixmap.clone();
-            let depth = self.undo_stack.len();
+            let pixmap = self.doc.pixmap.clone();
+            let depth = self.doc.undo_depth();
             if self.write_image_data(&pixmap, depth, path, cx) {
                 if let Some(action) = continuation {
                     self.perform_discard_action(action, window, cx);
@@ -2672,8 +1521,8 @@ impl Application {
         }
 
         let dialog = self.prepare_save_dialog();
-        let current_pixmap = self.pixmap.clone();
-        let current_depth = self.undo_stack.len();
+        let current_pixmap = self.doc.pixmap.clone();
+        let current_depth = self.doc.undo_depth();
         self.is_saving = true;
 
         cx.spawn(async move |this, cx| {
@@ -2705,39 +1554,12 @@ impl Application {
         path: PathBuf,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(format) = save_format(&path) else {
-            show_error(&t!("error.unsupported_ext"));
-            return false;
-        };
-
-        // formats that can store transparency; the others get the image flattened onto white
-        let keep_alpha = matches!(
-            format,
-            image::ImageFormat::Png | image::ImageFormat::WebP | image::ImageFormat::Gif | image::ImageFormat::Tiff
-        );
-        let (w, h) = (pixmap.width as u32, pixmap.height as u32);
-        let dynamic = if keep_alpha {
-            let data: Vec<u8> = pixmap.pixels.iter().flatten().copied().collect();
-            image::RgbaImage::from_raw(w, h, data).map(image::DynamicImage::ImageRgba8)
-        } else {
-            let data: Vec<u8> = pixmap.pixels.iter().flat_map(|p| {
-                let a = p[3] as u32;
-                let f = |c: u8| ((c as u32 * a + 255 * (255 - a) + 127) / 255) as u8;
-                [f(p[0]), f(p[1]), f(p[2])]
-            }).collect();
-            image::RgbImage::from_raw(w, h, data).map(image::DynamicImage::ImageRgb8)
-        };
-        let Some(img) = dynamic else {
-            show_error(&t!("error.build_image"));
-            return false;
-        };
-        if let Err(e) = img.save_with_format(&path, format) {
-            show_error(&t!("error.save_image", error = e));
+        if let Err(e) = pixmap.save(&path) {
+            show_error(&image_error_message(&e));
             return false;
         }
-
-        self.file_path = Some(path);
-        self.saved_depth = Some(saved_depth);
+        self.doc.file_path = Some(path);
+        self.doc.mark_saved(saved_depth);
         self.mark_dirty();
         cx.notify();
         true
@@ -2778,13 +1600,13 @@ impl Application {
                 .tooltip(label)
                 .icon(icon)
                 .small()
-                .checked(self.tool == tool)
+                .checked(self.painter.tool == tool)
                 .on_click(cx.listener(move |this, _checked, _, cx| {
                     // leaving the selection tool flattens the selection
                     if tool != Tool::Select {
                         this.commit_selection();
                     }
-                    this.tool = tool;
+                    this.painter.tool = tool;
                     this.mark_dirty();
                     cx.notify();
                 })),
@@ -2862,18 +1684,18 @@ impl Application {
 
         // rectangle / ellipse style
         let filled_toggle = Toggle::new("filled").tooltip("Filled").small()
-            .icon(IconName::Droplets).checked(self.shape_filled)
+            .icon(IconName::Droplets).checked(self.painter.shape_filled)
             .on_click(cx.listener(|this, checked, _, cx| {
-                this.shape_filled = *checked; cx.notify();
+                this.painter.shape_filled = *checked; cx.notify();
             }));
 
         // anti-aliasing on/off
         let aa_toggle = Toggle::new("antialias")
             .tooltip("Anti-alias")
             .small().icon(IconName::ALargeSmall)
-            .checked(self.antialias)
+            .checked(self.painter.antialias)
             .on_click(cx.listener(|this, checked, _, cx| {
-                this.antialias = *checked;
+                this.painter.antialias = *checked;
                 cx.notify();
             }));
 
@@ -2904,7 +1726,7 @@ impl Application {
         for hex in PALETTE {
             let rgba = hex_to_rgba(hex);
             let hsla = rgba_to_hsla(rgba);
-            let selected = self.current_color[0..3] == rgba[0..3];
+            let selected = self.painter.color[0..3] == rgba[0..3];
             grid = grid.child(
                 div()
                     .w(px(SWATCH_SIZE))
@@ -2917,7 +1739,7 @@ impl Application {
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
                             // change the drawing color for subsequent operations
-                            this.current_color = rgba;
+                            this.painter.color = rgba;
                             // keep the picker's displayed color in sync (does not emit Change)
                             this.color_picker
                                 .update(cx, |state, cx| state.set_value(hsla, window, cx));
@@ -2953,19 +1775,19 @@ impl Application {
 
         // file name for the footer (the full path goes into the tooltip)
         let full_path = self
-            .file_path
+            .doc.file_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "Untitled (not saved yet)".to_string());
         let base_name = self
-            .file_path
+            .doc.file_path
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Untitled".to_string());
-        let file_text = if self.is_modified() { format!("*{base_name}") } else { base_name };
+        let file_text = if self.doc.is_modified() { format!("*{base_name}") } else { base_name };
 
-        let size_text = format!("{} × {} px", self.pixmap.width, self.pixmap.height);
+        let size_text = format!("{} × {} px", self.doc.pixmap.width, self.doc.pixmap.height);
         let cursor_text = self
             .cursor_px
             .map(|(x, y)| format!("{}, {}", x, y))
@@ -2973,7 +1795,7 @@ impl Application {
 
         // size of the selection (empty when nothing is selected)
         let selection_text = self
-            .selection
+            .doc.selection
             .as_ref()
             .map(|s| format!("{} × {} px", s.w, s.h))
             .unwrap_or_default();
@@ -3064,8 +1886,8 @@ impl Render for Application {
         // pointer shape: closed hand while moving the selection, open hand over it
         let pointer = match self.drag {
             Drag::SelectMove { .. } | Drag::Pan { .. } => CursorStyle::ClosedHand,
-            Drag::None if self.over_selection && self.selection.is_some() => CursorStyle::OpenHand,
-            _ => if self.tool == Tool::Text { CursorStyle::IBeam } else { CursorStyle::Crosshair },
+            Drag::None if self.over_selection && self.doc.selection.is_some() => CursorStyle::OpenHand,
+            _ => if self.painter.tool == Tool::Text { CursorStyle::IBeam } else { CursorStyle::Crosshair },
         };
 
         let (bar_x, bar_y) = self.scrollbar_layout();
@@ -3252,11 +2074,6 @@ fn url_to_path(url: &str) -> Option<PathBuf> {
     String::from_utf8(out).ok().map(PathBuf::from)
 }
 
-/// the image format of a path, if it can be written with the `image` crate
-fn save_format(path: &Path) -> Option<image::ImageFormat> {
-    image::ImageFormat::from_path(path).ok().filter(|f| f.can_write())
-}
-
 /// ask whether unsaved changes should be saved first
 fn confirm_unsaved() -> rfd::MessageDialogResult {
     rfd::MessageDialog::new()
@@ -3265,6 +2082,17 @@ fn confirm_unsaved() -> rfd::MessageDialogResult {
         .set_description(t!("confirm.unsaved"))
         .set_buttons(rfd::MessageButtons::YesNoCancel)
         .show()
+}
+
+/// Localized message of an image error.
+fn image_error_message(e: &ImageError) -> String {
+    match e {
+        ImageError::UnsupportedExtension => t!("error.unsupported_ext").to_string(),
+        ImageError::Build => t!("error.build_image").to_string(),
+        ImageError::Encode(msg) => t!("error.encode_image", error = msg).to_string(),
+        ImageError::Save(msg) => t!("error.save_image", error = msg).to_string(),
+        ImageError::Open(msg) => t!("error.open_image", error = msg).to_string(),
+    }
 }
 
 fn show_error(message: &str) {
