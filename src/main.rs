@@ -369,7 +369,7 @@ impl Pixmap {
     fn new(width: usize, height: usize, fill: [u8; 4]) -> Self {
         Self { width, height, pixels: vec![fill; width * height], dirty: None }
     }
-    fn from(img: image::RgbaImage) -> Self {
+    fn from_image(img: image::RgbaImage) -> Self {
         let (width, height) = (img.width() as usize, img.height() as usize);
         let pixels = img.pixels()
             .map(|p| if p[3] == 0 { [0, 0, 0, 0] } else { [p[0], p[1], p[2], p[3]] })
@@ -1661,7 +1661,7 @@ impl Application {
             show_error(&t!("error.clipboard_size", max_size = MAX_CANVAS_SIZE));
             return;
         }
-        let pasted = Pixmap::from(decoded);
+        let pasted = Pixmap::from_image(decoded);
 
         // flatten the previous selection first
         self.commit_selection();
@@ -2607,7 +2607,7 @@ impl Application {
                         return;
                     }
                 };
-                let pixmap = Pixmap::from(img);
+                let pixmap = Pixmap::from_image(img);
                 self.replace_pixmap(pixmap, false);
                 self.file_path = Some(path);
                 self.scroll = (0., 0.);
