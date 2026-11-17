@@ -28,6 +28,9 @@ use model::{
     TextRenderer, Tool, BACKGROUND_WHITE, MAX_CANVAS_SIZE,
 };
 
+mod mcp;
+use mcp::{CanvasInfo, McpOp, McpReply, McpRequest};
+
 // Windows-only native clipboard access (CF_DIB / CF_DIBV5 / "PNG")
 #[cfg(windows)]
 mod win_clipboard;
@@ -152,6 +155,7 @@ impl Application {
     fn new(
         initial_file: Option<PathBuf>,
         open_rx: Option<UnboundedReceiver<PathBuf>>,
+        mcp_rx: Option<UnboundedReceiver<McpRequest>>,
         window: &mut Window,
         cx: &mut Context<Self>) -> Self
     {
@@ -287,6 +291,19 @@ impl Application {
                         // asks about unsaved changes first, like the Open dialog does
                         this.check_discard_and_run(DiscardAction::LoadImage(path), window, cx);
                     });
+                    if alive.is_err() {
+                        break; // the view is gone
+                    }
+                }
+            })
+            .detach();
+        }
+
+        // requests from the MCP server (opt-in with --mcp-port)
+        if let Some(mut rx) = mcp_rx {
+            cx.spawn(async move |this, cx| {
+                while let Some(req) = rx.next().await {
+                    let alive = this.update_in(cx, |this, window, cx| this.handle_mcp(req, window, cx));
                     if alive.is_err() {
                         break; // the view is gone
                     }
@@ -1348,6 +1365,73 @@ impl Application {
         }
     }
 
+    // -- MCP -----------------------------------------------------------------
+
+    fn handle_mcp(&mut self, req: McpRequest, window: &mut Window, cx: &mut Context<Self>) {
+        let McpRequest { op, reply } = req;
+        // the caller gave up waiting (timeout): do not run the operation late
+        if reply.is_canceled() {
+            return;
+        }
+        let result = if self.is_saving {
+            Err("the application is busy: a save dialog is open".to_string())
+        } else {
+            self.run_mcp_op(op, window, cx)
+        };
+        let _ = reply.send(result);
+    }
+
+    fn run_mcp_op(&mut self, op: McpOp, window: &mut Window, cx: &mut Context<Self>) -> Result<McpReply, String> {
+        match op {
+            McpOp::GetCanvasInfo => Ok(McpReply::Info(CanvasInfo {
+                width: self.doc.pixmap.width,
+                height: self.doc.pixmap.height,
+                color: mcp::format_color(self.painter.color),
+                brush_size: self.painter.brush_size,
+                antialias: self.painter.antialias,
+                modified: self.doc.is_modified(),
+                file: self.doc.file_path.as_ref().map(|p| p.display().to_string()),
+            })),
+            McpOp::GetImage => {
+                // show a lifted selection as part of the image, without touching the user's state
+                let mut pixmap = self.doc.pixmap.clone();
+                if let Some(sel) = &self.doc.selection {
+                    if let Some(floating) = &sel.floating {
+                        pixmap.paste(floating, sel.x, sel.y);
+                    }
+                }
+                pixmap.to_png().map(McpReply::Png).map_err(|e| e.to_string())
+            }
+            McpOp::SetColor(rgba) => {
+                self.painter.color = rgba;
+                // keep the picker's displayed color in sync (does not emit Change)
+                let hsla = rgba_to_hsla(rgba);
+                self.color_picker.update(cx, |state, cx| state.set_value(hsla, window, cx));
+                cx.notify();
+                Ok(McpReply::Done)
+            }
+            McpOp::DrawLine { from, to, size, color } => {
+                // end whatever the user is doing, so that the history stays consistent
+                self.finish_drag();
+                self.commit_selection();
+                // size and color apply to this call only
+                let (saved_color, saved_size) = (self.painter.color, self.painter.brush_size);
+                if let Some(color) = color {
+                    self.painter.color = color;
+                }
+                if let Some(size) = size {
+                    self.painter.brush_size = size;
+                }
+                self.painter.draw_shape_once(&mut self.doc, Tool::Line, from, to);
+                self.painter.color = saved_color;
+                self.painter.brush_size = saved_size;
+                self.mark_dirty();
+                cx.notify();
+                Ok(McpReply::Done)
+            }
+        }
+    }
+
     // -- files ---------------------------------------------------------------
 
     fn handle_window_close(&mut self, cx: &mut Context<Self>) -> bool {
@@ -2106,6 +2190,55 @@ fn update_theme_color(cx: &mut App) {
     }
 }
 
+#[derive(Default)]
+struct Args {
+    // the first argument that is not an option: the image file to open
+    initial_file: Option<PathBuf>,
+    mcp_port: Option<u16>,
+    mcp_token: Option<String>,
+}
+
+fn parse_args() -> Result<Args, String> {
+    let mut args = Args::default();
+    let mut it = std::env::args_os().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.to_str() {
+            Some("--mcp-port") => {
+                let value = it.next().and_then(|v| v.into_string().ok()).ok_or("--mcp-port needs a value")?;
+                args.mcp_port = Some(value.parse().map_err(|_| format!("invalid port: {value}"))?);
+            }
+            Some("--mcp-token") => {
+                let value = it.next().and_then(|v| v.into_string().ok()).ok_or("--mcp-token needs a value")?;
+                args.mcp_token = Some(value);
+            }
+            _ => {
+                if args.initial_file.is_none() {
+                    args.initial_file = Some(PathBuf::from(arg));
+                }
+            }
+        }
+    }
+    Ok(args)
+}
+
+/// Start the MCP server; errors are reported with a dialog (the release build has no console).
+fn start_mcp(port: u16, token: Option<String>) -> Option<UnboundedReceiver<McpRequest>> {
+    // the token may come from the environment, which keeps it out of the process list
+    let token = token.or_else(|| std::env::var("MIN_PAINT_MCP_TOKEN").ok()).unwrap_or_default();
+    if token.len() < 16 {
+        show_error("The MCP server needs an access token of at least 16 characters \
+                    (--mcp-token or the MIN_PAINT_MCP_TOKEN environment variable).");
+        return None;
+    }
+    match mcp::start(port, token) {
+        Ok(rx) => Some(rx),
+        Err(e) => {
+            show_error(&format!("Failed to start the MCP server on 127.0.0.1:{port}: {e}"));
+            None
+        }
+    }
+}
+
 fn main() {
 
     // i18n
@@ -2113,8 +2246,18 @@ fn main() {
         rust_i18n::set_locale(&locale);
     }
 
-    // the first command line argument is the image file to open
-    let initial_file: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(message) => {
+            show_error(&message);
+            return;
+        }
+    };
+    let Args { initial_file, mcp_port, mcp_token } = args;
+
+    // MCP requests are forwarded to the UI through a channel (opt-in)
+    let mcp_rx = mcp_port.and_then(|port| start_mcp(port, mcp_token));
+    let mcp_rx = Rc::new(RefCell::new(mcp_rx));
 
     // open requests from the OS (Finder) are forwarded to the UI through a channel;
     // events that arrive before the window exists are buffered
@@ -2130,6 +2273,7 @@ fn main() {
             }
         }
     });
+
     app.run(move |cx| {
         init(cx);
 
@@ -2139,7 +2283,8 @@ fn main() {
         let window_options = window_options(cx);
         open_window(window_options, cx, move |window, cx| {
             let open_rx = open_rx.borrow_mut().take();
-            cx.new(|cx| Application::new(initial_file.clone(), open_rx, window, cx))
+            let mcp_rx = mcp_rx.borrow_mut().take();
+            cx.new(|cx| Application::new(initial_file.clone(), open_rx, mcp_rx, window, cx))
         })
         .expect("failed to open window");
 

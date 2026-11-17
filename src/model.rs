@@ -1257,12 +1257,14 @@ impl Painter {
     }
 
     /// Draw a whole shape in one call, as one undo step (no mouse drag involved).
-    #[allow(dead_code)] // used by mcp.rs later
-    pub fn draw_shape_once(&mut self, doc: &mut Document, start: (i32, i32), end: (i32, i32)) {
+    /// The painter's tool is only changed for the duration of the call.
+    pub fn draw_shape_once(&mut self, doc: &mut Document, tool: Tool, start: (i32, i32), end: (i32, i32)) {
         doc.commit_selection();
+        let previous = std::mem::replace(&mut self.tool, tool);
         self.begin_shape(&mut doc.pixmap, start);
         self.update_shape(&mut doc.pixmap, start, end);
         self.finish();
+        self.tool = previous;
         doc.record_history();
     }
 }
