@@ -759,6 +759,24 @@ impl Pixmap {
 
 }
 
+// -- canvas size --------------------------------------------------------------
+
+pub const MAX_CANVAS_SIZE: usize = 4096;
+
+/// The requested canvas size is zero or larger than `MAX_CANVAS_SIZE`.
+#[derive(Debug)]
+pub struct SizeError;
+
+impl std::fmt::Display for SizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "canvas size must be between 1 and {MAX_CANVAS_SIZE} pixels")
+    }
+}
+
+pub fn is_valid_canvas_size(width: usize, height: usize) -> bool {
+    width > 0 && height > 0 && width <= MAX_CANVAS_SIZE && height <= MAX_CANVAS_SIZE
+}
+
 // -- history & document -----------------------------------------------------
 
 /// Maximum number of undo steps kept.
@@ -987,22 +1005,51 @@ impl Document {
         })
     }
 
-    // -- canvas size ----------------------------------------------------------
-
-    /// Trim the canvas to `width` x `height`, starting in the top-left corner of the
+    /// Trim the canvas to `width` x `height`, starting at the top-left corner of the
     /// selection (the canvas origin if nothing is selected). The part outside the current
-    /// canvas becomes the background. Returns false when nothing would change.
-    pub fn trim(&mut self, width: usize, height: usize) -> bool {
+    /// canvas becomes the background.
+    /// Returns `Ok(false)` when nothing would change, and `Err` for an invalid size
+    /// (checked before the selection is touched).
+    pub fn trim(&mut self, width: usize, height: usize) -> Result<bool, SizeError> {
+        if !is_valid_canvas_size(width, height) {
+            return Err(SizeError);
+        }
         // read the origin before the selection is flattened
         let (ox, oy) = self.selection.as_ref().map_or((0, 0), |s| (s.x, s.y));
         if (ox, oy) == (0, 0) && width == self.pixmap.width && height == self.pixmap.height {
-            return false;
+            return Ok(false);
         }
         // flatten a floating selection so that its pixels are part of the trimmed image
         self.commit_selection();
         let new_pixmap = self.pixmap.copy_region(ox, oy, width as i32, height as i32);
         self.replace_pixmap(new_pixmap, true);
-        true
+        Ok(true)
+    }
+    /// Grow the canvas to at least `width` x `height`, keeping the existing pixels in the
+    /// top-left corner (undoable). Returns `Ok(false)` when it already is that large.
+    pub fn grow_to(&mut self, width: usize, height: usize) -> Result<bool, SizeError> {
+        let (old_w, old_h) = (self.pixmap.width, self.pixmap.height);
+        let (new_w, new_h) = (width.max(old_w), height.max(old_h));
+        if (new_w, new_h) == (old_w, old_h) {
+            return Ok(false);
+        }
+        if !is_valid_canvas_size(new_w, new_h) {
+            return Err(SizeError);
+        }
+        self.commit_selection();
+        let mut grown = Pixmap::new(new_w, new_h, BACKGROUND);
+        let data = self.pixmap.read_region(0, 0, old_w, old_h);
+        grown.write_region(0, 0, old_w, old_h, &data);
+        self.replace_pixmap(grown, true);
+        Ok(true)
+    }
+
+    /// Place `pixmap` as a floating selection at (x, y). The previous selection is
+    /// flattened first; the pixels are committed when the selection is.
+    pub fn paste_floating(&mut self, pixmap: Pixmap, x: i32, y: i32) {
+        self.commit_selection();
+        let (w, h) = (pixmap.width as i32, pixmap.height as i32);
+        self.selection = Some(Selection { x, y, w, h, floating: Some(pixmap) });
     }
 }
 

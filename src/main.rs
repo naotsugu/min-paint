@@ -24,8 +24,8 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 mod model;
 use model::{
-    over, save_format, Document, ImageError, Painter, Pixmap, Selection, TextRenderer, Tool,
-    BACKGROUND, BACKGROUND_WHITE,
+    is_valid_canvas_size, over, save_format, Document, ImageError, Painter, Pixmap, SizeError,
+    TextRenderer, Tool, BACKGROUND_WHITE, MAX_CANVAS_SIZE,
 };
 
 // Windows-only native clipboard access (CF_DIB / CF_DIBV5 / "PNG")
@@ -62,7 +62,6 @@ const MAX_ZOOM_PERCENT: f32 = 1600.;
 const GRID_MIN_ZOOM: f32 = 8.;
 
 const DEFAULT_CANVAS_SIZE: (usize, usize) = (600, 500);
-const MAX_CANVAS_SIZE: usize = 4096;
 
 // checkerboard shown behind transparent pixels
 const CHECKER_CELL: f32 = 8.; // logical pixels
@@ -721,7 +720,7 @@ impl Application {
             }
         };
         let (w, h) = (decoded.width() as usize, decoded.height() as usize);
-        if w == 0 || h == 0 || w > MAX_CANVAS_SIZE || h > MAX_CANVAS_SIZE {
+        if !is_valid_canvas_size(w, h) {
             show_error(&t!("error.clipboard_size", max_size = MAX_CANVAS_SIZE));
             return;
         }
@@ -730,13 +729,9 @@ impl Application {
         // flatten the previous selection first
         self.commit_selection();
 
-        // grow the canvas when the image does not fit (undoable)
-        if w > self.doc.pixmap.width || h > self.doc.pixmap.height {
-            let (old_w, old_h) = (self.doc.pixmap.width, self.doc.pixmap.height);
-            let mut grown = Pixmap::new(w.max(old_w), h.max(old_h), BACKGROUND);
-            let data = self.doc.pixmap.read_region(0, 0, old_w, old_h);
-            grown.write_region(0, 0, old_w, old_h, &data);
-            self.replace_pixmap(grown, true);
+        // grow the canvas when the image does not fit (undoable); the size was validated above
+        if matches!(self.doc.grow_to(w, h), Ok(true)) {
+            self.drag = Drag::None;
             self.sync_size_inputs(window, cx);
         }
 
@@ -767,7 +762,7 @@ impl Application {
         let y = place(vy0, vy1, h as i32, bh - h as i32);
 
         self.painter.tool = Tool::Select;
-        self.doc.selection = Some(Selection { x, y, w: w as i32, h: h as i32, floating: Some(pasted) });
+        self.doc.paste_floating(pasted, x, y);
         self.mark_dirty();
         cx.notify();
     }
@@ -956,15 +951,16 @@ impl Application {
             show_error(&t!("error.size_not_number"));
             return false;
         };
-        if width == 0 || height == 0 || width > MAX_CANVAS_SIZE || height > MAX_CANVAS_SIZE {
-            show_error(&t!("error.size_range", max_size = MAX_CANVAS_SIZE));
-            return false;
-        }
-        // the trim origin is the top-left corner of the selection (the canvas origin if nothing is selected);
-        // it is read before the selection is flattened, and only after validation succeeded,
-        // so that a rejected input leaves the selection intact for the next try
-        if !self.doc.trim(width, height) {
-            return false;
+        // the trim origin is the top-left corner of the selection (see Document::trim);
+        // the range is validated before the selection is touched, so that a rejected
+        // input leaves the selection intact for the next try
+        match self.doc.trim(width, height) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(SizeError) => {
+                show_error(&t!("error.size_range", max_size = MAX_CANVAS_SIZE));
+                return false;
+            }
         }
         self.drag = Drag::None;
         self.mark_dirty();
