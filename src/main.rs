@@ -122,7 +122,8 @@ pub struct Application {
     // last pixel touched while dragging (canvas coordinates)
     last_pos: (i32, i32),
     // whether the mouse pointer is over the selection (decides the pointer shape)
-    over_selection: bool,    // pixel under the mouse pointer, if it is inside the canvas
+    over_selection: bool,
+    // pixel under the mouse pointer, if it is inside the canvas
     cursor_px: Option<(i32, i32)>,
     zoom_percent: f32,
     // how far the viewport is scrolled into the content, in logical pixels (>= 0)
@@ -493,9 +494,7 @@ impl Application {
         }
 
         // lifted selection pixels are drawn on top of the pixel map
-        let floating = self
-            .doc.selection
-            .as_ref()
+        let floating = self.doc.selection.as_ref()
             .and_then(|s| s.floating.as_ref().map(|f| (s.x, s.y, f)));
 
         let [bg_r, bg_g, bg_b] = to_rgb8(invert_lightness(cx.theme().muted_foreground));
@@ -943,10 +942,10 @@ impl Application {
 
     // show the given size in the width / height inputs
     fn set_size_inputs(&mut self, width: usize, height: usize, window: &mut Window, cx: &mut Context<Self>) {
-            let width = width.to_string();
-            let height = height.to_string();
-            self.width_input.update(cx, |state, cx| state.set_value(width, window, cx));
-            self.height_input.update(cx, |state, cx| state.set_value(height, window, cx));
+        let width = width.to_string();
+        let height = height.to_string();
+        self.width_input.update(cx, |state, cx| state.set_value(width, window, cx));
+        self.height_input.update(cx, |state, cx| state.set_value(height, window, cx));
     }
 
     fn apply_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -1319,7 +1318,7 @@ impl Application {
         if self.is_saving {
             return;
         }
-        // the control keep their own keyboard handling
+        // the controls keep their own keyboard handling
         if self.size_select.focus_handle(cx).is_focused(window)
         || self.color_picker.focus_handle(cx).is_focused(window)
         || self.width_input.focus_handle(cx).is_focused(window)
@@ -1794,9 +1793,7 @@ impl Application {
             .unwrap_or_default();
 
         // size of the selection (empty when nothing is selected)
-        let selection_text = self
-            .doc.selection
-            .as_ref()
+        let selection_text = self.doc.selection.as_ref()
             .map(|s| format!("{} × {} px", s.w, s.h))
             .unwrap_or_default();
 
