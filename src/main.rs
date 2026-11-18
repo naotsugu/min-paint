@@ -29,7 +29,7 @@ use model::{
 };
 
 mod mcp;
-use mcp::{CanvasInfo, McpOp, McpReply, McpRequest};
+use mcp::{CanvasInfo, McpOp, McpReply, McpRequest, Style};
 
 // Windows-only native clipboard access (CF_DIB / CF_DIBV5 / "PNG")
 #[cfg(windows)]
@@ -1382,6 +1382,43 @@ impl Application {
     }
 
     fn run_mcp_op(&mut self, op: McpOp, window: &mut Window, cx: &mut Context<Self>) -> Result<McpReply, String> {
+        let is_edit = op.is_edit();
+        if is_edit {
+            // end whatever the user is doing, so that the history stays consistent
+            self.finish_drag();
+            self.commit_selection();
+        }
+        let result = self.exec_mcp_op(op, window, cx);
+        if is_edit {
+            self.mark_dirty();
+            cx.notify();
+        }
+        result
+    }
+
+    /// Run `f` with the painter settings of `style` applied for this call only.
+    fn with_style<R>(&mut self, style: &Style, f: impl FnOnce(&mut Self) -> R) -> R {
+        let p = &mut self.painter;
+        let saved = (p.color, p.brush_size, p.shape_filled, p.antialias);
+        if let Some(v) = style.color {
+            p.color = v;
+        }
+        if let Some(v) = style.size {
+            p.brush_size = v;
+        }
+        if let Some(v) = style.filled {
+            p.shape_filled = v;
+        }
+        if let Some(v) = style.antialias {
+            p.antialias = v;
+        }
+        let result = f(self);
+        let p = &mut self.painter;
+        (p.color, p.brush_size, p.shape_filled, p.antialias) = saved;
+        result
+    }
+
+    fn exec_mcp_op(&mut self, op: McpOp, window: &mut Window, cx: &mut Context<Self>) -> Result<McpReply, String> {
         match op {
             McpOp::GetCanvasInfo => Ok(McpReply::Info(CanvasInfo {
                 width: self.doc.pixmap.width,
@@ -1402,6 +1439,7 @@ impl Application {
                 }
                 pixmap.to_png().map(McpReply::Png).map_err(|e| e.to_string())
             }
+            McpOp::ListFonts => Ok(McpReply::Fonts(self.text.families().to_vec())),
             McpOp::SetColor(rgba) => {
                 self.painter.color = rgba;
                 // keep the picker's displayed color in sync (does not emit Change)
@@ -1410,28 +1448,65 @@ impl Application {
                 cx.notify();
                 Ok(McpReply::Done)
             }
-            McpOp::DrawLine { from, to, size, color } => {
-                // end whatever the user is doing, so that the history stays consistent
-                self.finish_drag();
-                self.commit_selection();
-                // size and color apply to this call only
-                let (saved_color, saved_size) = (self.painter.color, self.painter.brush_size);
-                if let Some(color) = color {
-                    self.painter.color = color;
-                }
-                if let Some(size) = size {
-                    self.painter.brush_size = size;
-                }
-                self.painter.draw_shape_once(&mut self.doc, Tool::Line, from, to);
-                self.painter.color = saved_color;
-                self.painter.brush_size = saved_size;
-                self.mark_dirty();
-                cx.notify();
+            McpOp::Shape { tool, from, to, style } => {
+                self.with_style(&style, |this| this.painter.draw_shape_once(&mut this.doc, tool, from, to));
                 Ok(McpReply::Done)
+            }
+            McpOp::Fill { at, style } => {
+                self.with_style(&style, |this| this.painter.fill(&mut this.doc.pixmap, at));
+                self.doc.record_history();
+                Ok(McpReply::Done)
+            }
+            McpOp::Mosaic { x, y, w, h, block } => {
+                self.doc.pixmap.mosaic(x, y, w, h, block);
+                self.doc.record_history();
+                Ok(McpReply::Done)
+            }
+            McpOp::Text { text, at, font_size, font, style } => {
+                if let Some(name) = &font {
+                    if !self.text.families().iter().any(|f| f == name) {
+                        return Err(format!("font {name:?} is not installed (see list_fonts)"));
+                    }
+                }
+                let drawn = self.with_style(&style, |this| {
+                    this.text.render(
+                        &mut this.doc.pixmap,
+                        &text,
+                        font_size,
+                        font.as_deref(),
+                        at,
+                        this.painter.color,
+                        this.painter.antialias,
+                    )
+                });
+                if !drawn {
+                    return Err("nothing was drawn (is the position inside the canvas?)".to_string());
+                }
+                if font.is_some() {
+                    self.text.last_font = font;
+                }
+                self.doc.record_history();
+                Ok(McpReply::Done)
+            }
+            McpOp::Undo => {
+                if self.doc.undo() {
+                    self.after_history_change(window, cx);
+                    Ok(McpReply::Done)
+                } else {
+                    Err("nothing to undo".to_string())
+                }
+            }
+            McpOp::Redo => {
+                if self.doc.redo() {
+                    self.after_history_change(window, cx);
+                    Ok(McpReply::Done)
+                } else {
+                    Err("nothing to redo".to_string())
+                }
             }
         }
     }
-
+    
     // -- files ---------------------------------------------------------------
 
     fn handle_window_close(&mut self, cx: &mut Context<Self>) -> bool {

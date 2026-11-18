@@ -22,33 +22,55 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::{Deserialize, Serialize};
 
-use crate::model::MAX_CANVAS_SIZE;
+use crate::model::{Tool, MAX_CANVAS_SIZE};
 
 // Coordinates are limited so that a request cannot keep the UI thread busy for long.
 const COORD_LIMIT: i32 = 2 * MAX_CANVAS_SIZE as i32;
 const MAX_BRUSH_SIZE: i32 = 64;
+const MAX_TEXT_CHARS: usize = 500;
+const DEFAULT_FONT_SIZE: f32 = 24.;
+const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 6.0..=500.0;
 // how long a tool call waits for the UI (it cannot answer while a native dialog is open)
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 // -- messages between the server thread and the UI -------------------------------
 
+/// Per-call overrides of the painter settings; `None` keeps the application's value.
+#[derive(Default)]
+pub struct Style {
+    pub size: Option<i32>,
+    pub color: Option<[u8; 4]>,
+    pub filled: Option<bool>,
+    pub antialias: Option<bool>,
+}
+
 /// An operation for the UI thread. Values are already validated.
 pub enum McpOp {
     GetCanvasInfo,
     GetImage,
+    ListFonts,
     SetColor([u8; 4]),
-    DrawLine {
-        from: (i32, i32),
-        to: (i32, i32),
-        size: Option<i32>,
-        color: Option<[u8; 4]>,
-    },
+    /// line / rectangle / oval / arrow between two canvas pixels
+    Shape { tool: Tool, from: (i32, i32), to: (i32, i32), style: Style },
+    Fill { at: (i32, i32), style: Style },
+    Mosaic { x: i32, y: i32, w: i32, h: i32, block: i32 },
+    Text { text: String, at: (i32, i32), font_size: f32, font: Option<String>, style: Style },
+    Undo,
+    Redo,
+}
+
+impl McpOp {
+    /// Operations that change the document or its history.
+    pub fn is_edit(&self) -> bool {
+        !matches!(self, Self::GetCanvasInfo | Self::GetImage | Self::ListFonts | Self::SetColor(_))
+    }
 }
 
 pub enum McpReply {
     Done,
     Info(CanvasInfo),
     Png(Vec<u8>),
+    Fonts(Vec<String>),
 }
 
 pub struct McpRequest {
@@ -77,20 +99,70 @@ struct SetColorParams {
     color: String,
 }
 
+/// Parameters of line / rectangle / ellipse / arrow: two points in canvas pixels.
 #[derive(Deserialize, schemars::JsonSchema)]
-struct DrawLineParams {
-    /// Start point, x in canvas pixels (0 = left edge).
+struct ShapeParams {
+    /// First point, x in canvas pixels (0 = left edge). The arrow starts here.
     x0: i32,
-    /// Start point, y in canvas pixels (0 = top edge).
+    /// First point, y in canvas pixels (0 = top edge).
     y0: i32,
-    /// End point, x in canvas pixels.
+    /// Second point, x in canvas pixels. The arrow head is here.
     x1: i32,
-    /// End point, y in canvas pixels.
+    /// Second point, y in canvas pixels.
     y1: i32,
-    /// Line width in pixels (1-64). Defaults to the current brush size.
+    /// Line width in pixels (1-64); for an arrow, the size of the whole arrow.
+    /// Defaults to the current brush size.
     size: Option<i32>,
     /// Color as "#rrggbb". Defaults to the current drawing color.
     color: Option<String>,
+    /// Fill the shape (rectangle and ellipse only). Defaults to the current setting.
+    filled: Option<bool>,
+    /// Anti-aliased edges. Defaults to the current setting.
+    antialias: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct FillParams {
+    /// x of the clicked pixel in canvas pixels.
+    x: i32,
+    /// y of the clicked pixel in canvas pixels.
+    y: i32,
+    /// Color as "#rrggbb". Defaults to the current drawing color.
+    color: Option<String>,
+    /// Also recolor the anti-aliased pixels around the region. Defaults to the current setting.
+    antialias: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct MosaicParams {
+    /// Left edge of the rectangle in canvas pixels.
+    x: i32,
+    /// Top edge of the rectangle in canvas pixels.
+    y: i32,
+    /// Width of the rectangle in pixels.
+    width: i32,
+    /// Height of the rectangle in pixels.
+    height: i32,
+    /// Edge length of one mosaic cell in pixels (larger = coarser).
+    block_size: i32,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct TextParams {
+    /// The text to draw (up to 500 characters).
+    text: String,
+    /// Left edge of the text in canvas pixels.
+    x: i32,
+    /// Top edge of the text in canvas pixels.
+    y: i32,
+    /// Font size in pixels (6-500). Defaults to 24.
+    font_size: Option<f32>,
+    /// Font family name; see list_fonts. Defaults to the font used last, or a system font.
+    font: Option<String>,
+    /// Color as "#rrggbb". Defaults to the current drawing color.
+    color: Option<String>,
+    /// Anti-aliased text. Defaults to the current setting.
+    antialias: Option<bool>,
 }
 
 // -- server ---------------------------------------------------------------------
@@ -113,6 +185,14 @@ impl PaintServer {
             Err(_) => Err("timed out: the application did not respond (is a dialog open?)".to_string()),
         }
     }
+
+    /// Run a validated operation; a validation error becomes a tool error.
+    async fn run(&self, op: Result<McpOp, String>) -> Result<CallToolResult, McpError> {
+        Ok(match op {
+            Ok(op) => into_result(self.call(op).await),
+            Err(message) => tool_error(message),
+        })
+    }
 }
 
 #[tool_router]
@@ -120,29 +200,74 @@ impl PaintServer {
     #[tool(description = "Get the canvas size, the current drawing color, the brush size \
                           and whether there are unsaved changes.")]
     async fn get_canvas_info(&self) -> Result<CallToolResult, McpError> {
-        Ok(into_result(self.call(McpOp::GetCanvasInfo).await))
+        self.run(Ok(McpOp::GetCanvasInfo)).await
     }
 
     #[tool(description = "Get the current canvas as a PNG image.")]
     async fn get_image(&self) -> Result<CallToolResult, McpError> {
-        Ok(into_result(self.call(McpOp::GetImage).await))
+        self.run(Ok(McpOp::GetImage)).await
+    }
+
+    #[tool(description = "List the installed font families that draw_text accepts.")]
+    async fn list_fonts(&self) -> Result<CallToolResult, McpError> {
+        self.run(Ok(McpOp::ListFonts)).await
     }
 
     #[tool(description = "Set the current drawing color of the application (\"#rrggbb\").")]
     async fn set_color(&self, Parameters(p): Parameters<SetColorParams>) -> Result<CallToolResult, McpError> {
-        match parse_color(&p.color) {
-            Ok(color) => Ok(into_result(self.call(McpOp::SetColor(color)).await)),
-            Err(message) => Ok(tool_error(message)),
-        }
+        self.run(parse_color(&p.color).map(McpOp::SetColor)).await
     }
 
     #[tool(description = "Draw a straight line. Coordinates are canvas pixels with the origin at \
-                          the top-left; points outside the canvas are clipped. The line is one undo step.")]
-    async fn draw_line(&self, Parameters(p): Parameters<DrawLineParams>) -> Result<CallToolResult, McpError> {
-        match build_draw_line(p) {
-            Ok(op) => Ok(into_result(self.call(op).await)),
-            Err(message) => Ok(tool_error(message)),
-        }
+                          the top-left; parts outside the canvas are clipped. One undo step.")]
+    async fn draw_line(&self, Parameters(p): Parameters<ShapeParams>) -> Result<CallToolResult, McpError> {
+        self.run(build_shape(Tool::Line, p)).await
+    }
+
+    #[tool(description = "Draw a rectangle whose opposite corners are (x0, y0) and (x1, y1). \
+                          Outline by default; set filled to fill it. One undo step.")]
+    async fn draw_rectangle(&self, Parameters(p): Parameters<ShapeParams>) -> Result<CallToolResult, McpError> {
+        self.run(build_shape(Tool::Rectangle, p)).await
+    }
+
+    #[tool(description = "Draw an ellipse inscribed in the rectangle whose opposite corners are \
+                          (x0, y0) and (x1, y1). Outline by default; set filled to fill it. One undo step.")]
+    async fn draw_ellipse(&self, Parameters(p): Parameters<ShapeParams>) -> Result<CallToolResult, McpError> {
+        self.run(build_shape(Tool::Oval, p)).await
+    }
+
+    #[tool(description = "Draw an arrow from (x0, y0) to (x1, y1); the head is at the end. \
+                          size scales the arrow. One undo step.")]
+    async fn draw_arrow(&self, Parameters(p): Parameters<ShapeParams>) -> Result<CallToolResult, McpError> {
+        self.run(build_shape(Tool::Arrow, p)).await
+    }
+
+    #[tool(description = "Flood fill: replace the connected region of the color at (x, y) with \
+                          the drawing color. One undo step.")]
+    async fn flood_fill(&self, Parameters(p): Parameters<FillParams>) -> Result<CallToolResult, McpError> {
+        self.run(build_fill(p)).await
+    }
+
+    #[tool(description = "Pixelate a rectangle: every block_size x block_size cell is replaced by \
+                          its average color. One undo step.")]
+    async fn mosaic(&self, Parameters(p): Parameters<MosaicParams>) -> Result<CallToolResult, McpError> {
+        self.run(build_mosaic(p)).await
+    }
+
+    #[tool(description = "Draw text with its top-left corner at (x, y). Fails when the position \
+                          is outside the canvas. One undo step.")]
+    async fn draw_text(&self, Parameters(p): Parameters<TextParams>) -> Result<CallToolResult, McpError> {
+        self.run(build_text(p)).await
+    }
+
+    #[tool(description = "Undo the last edit. Fails when there is nothing to undo.")]
+    async fn undo(&self) -> Result<CallToolResult, McpError> {
+        self.run(Ok(McpOp::Undo)).await
+    }
+
+    #[tool(description = "Redo the last undone edit. Fails when there is nothing to redo.")]
+    async fn redo(&self) -> Result<CallToolResult, McpError> {
+        self.run(Ok(McpOp::Redo)).await
     }
 }
 
@@ -153,19 +278,24 @@ impl PaintServer {
 )]
 impl ServerHandler for PaintServer {}
 
-// -- helpers --------------------------------------------------------------------
+// -- results --------------------------------------------------------------------
 
 fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message.into())])
 }
 
+fn json_result<T: Serialize>(value: &T) -> CallToolResult {
+    match serde_json::to_string(value) {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+        Err(e) => tool_error(e.to_string()),
+    }
+}
+
 fn into_result(result: Result<McpReply, String>) -> CallToolResult {
     match result {
         Ok(McpReply::Done) => CallToolResult::success(vec![ContentBlock::text("ok")]),
-        Ok(McpReply::Info(info)) => match serde_json::to_string(&info) {
-            Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
-            Err(e) => tool_error(e.to_string()),
-        },
+        Ok(McpReply::Info(info)) => json_result(&info),
+        Ok(McpReply::Fonts(fonts)) => json_result(&fonts),
         Ok(McpReply::Png(png)) => {
             let data = base64::engine::general_purpose::STANDARD.encode(png);
             CallToolResult::success(vec![ContentBlock::image(data, "image/png")])
@@ -173,6 +303,8 @@ fn into_result(result: Result<McpReply, String>) -> CallToolResult {
         Err(message) => tool_error(message),
     }
 }
+
+// -- validation -----------------------------------------------------------------
 
 /// Parse "#rrggbb" or "#rrggbbaa" (the leading '#' is optional).
 pub fn parse_color(text: &str) -> Result<[u8; 4], String> {
@@ -207,16 +339,60 @@ fn check_point(name: &str, x: i32, y: i32) -> Result<(i32, i32), String> {
     }
 }
 
-fn build_draw_line(p: DrawLineParams) -> Result<McpOp, String> {
-    let from = check_point("(x0, y0)", p.x0, p.y0)?;
-    let to = check_point("(x1, y1)", p.x1, p.y1)?;
-    if let Some(size) = p.size {
+fn build_style(
+    size: Option<i32>,
+    color: Option<&str>,
+    filled: Option<bool>,
+    antialias: Option<bool>,
+) -> Result<Style, String> {
+    if let Some(size) = size {
         if !(1..=MAX_BRUSH_SIZE).contains(&size) {
             return Err(format!("size must be between 1 and {MAX_BRUSH_SIZE}"));
         }
     }
-    let color = p.color.as_deref().map(parse_color).transpose()?;
-    Ok(McpOp::DrawLine { from, to, size: p.size, color })
+    let color = color.map(parse_color).transpose()?;
+    Ok(Style { size, color, filled, antialias })
+}
+
+fn build_shape(tool: Tool, p: ShapeParams) -> Result<McpOp, String> {
+    let from = check_point("(x0, y0)", p.x0, p.y0)?;
+    let to = check_point("(x1, y1)", p.x1, p.y1)?;
+    let style = build_style(p.size, p.color.as_deref(), p.filled, p.antialias)?;
+    Ok(McpOp::Shape { tool, from, to, style })
+}
+
+fn build_fill(p: FillParams) -> Result<McpOp, String> {
+    let at = check_point("(x, y)", p.x, p.y)?;
+    let style = build_style(None, p.color.as_deref(), None, p.antialias)?;
+    Ok(McpOp::Fill { at, style })
+}
+
+fn build_mosaic(p: MosaicParams) -> Result<McpOp, String> {
+    check_point("(x, y)", p.x, p.y)?;
+    let max = MAX_CANVAS_SIZE as i32;
+    for (name, value) in [("width", p.width), ("height", p.height), ("block_size", p.block_size)] {
+        if !(1..=max).contains(&value) {
+            return Err(format!("{name} must be between 1 and {max}"));
+        }
+    }
+    Ok(McpOp::Mosaic { x: p.x, y: p.y, w: p.width, h: p.height, block: p.block_size })
+}
+
+fn build_text(p: TextParams) -> Result<McpOp, String> {
+    if p.text.is_empty() || p.text.chars().count() > MAX_TEXT_CHARS {
+        return Err(format!("text must be 1 to {MAX_TEXT_CHARS} characters long"));
+    }
+    let at = check_point("(x, y)", p.x, p.y)?;
+    let font_size = p.font_size.unwrap_or(DEFAULT_FONT_SIZE);
+    if !FONT_SIZE_RANGE.contains(&font_size) {
+        return Err(format!(
+            "font_size must be between {} and {}",
+            FONT_SIZE_RANGE.start(),
+            FONT_SIZE_RANGE.end()
+        ));
+    }
+    let style = build_style(None, p.color.as_deref(), None, p.antialias)?;
+    Ok(McpOp::Text { text: p.text, at, font_size, font: p.font, style })
 }
 
 // -- startup --------------------------------------------------------------------
