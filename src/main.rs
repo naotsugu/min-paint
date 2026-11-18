@@ -9,7 +9,7 @@ use futures::StreamExt as _;
 use gpui_kit::*;
 use gpui_kit::assets::{AllAssets, IconName};
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
-use gpui_kit::component::input::{Input, InputState, NumberInput};
+use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::button::{Button, ButtonVariants as _, Toggle};
@@ -29,7 +29,7 @@ use model::{
 };
 
 mod mcp;
-use mcp::{CanvasInfo, McpOp, McpReply, McpRequest, Style};
+use mcp::{CanvasInfo, McpEndpoint, McpOp, McpReply, McpRequest, Style};
 
 // Windows-only native clipboard access (CF_DIB / CF_DIBV5 / "PNG")
 #[cfg(windows)]
@@ -147,6 +147,12 @@ pub struct Application {
     xs_cache: Vec<i32>,
     ys_cache: Vec<i32>,
     focus_handle: FocusHandle,
+    // MCP server: Some once started (it keeps running until the application quits)
+    mcp_server: Option<McpEndpoint>,
+    // default token of the dialog, generated on first use and kept for the session
+    mcp_default_token: Option<String>,
+    // repaint the open dialog when its inputs change (replaced every time the dialog opens)
+    mcp_dialog_subs: Vec<Subscription>,
     // keep subscriptions alive for the lifetime of the view
     _subscriptions: Vec<Subscription>,
 }
@@ -155,7 +161,7 @@ impl Application {
     fn new(
         initial_file: Option<PathBuf>,
         open_rx: Option<UnboundedReceiver<PathBuf>>,
-        mcp_rx: Option<UnboundedReceiver<McpRequest>>,
+        mcp_options: McpOptions,
         window: &mut Window,
         cx: &mut Context<Self>) -> Self
     {
@@ -271,10 +277,25 @@ impl Application {
             xs_cache: Vec::new(),
             ys_cache: Vec::new(),
             focus_handle: cx.focus_handle(),
+            mcp_server: None,
+            mcp_default_token: None,
+            mcp_dialog_subs: Vec::new(),
             _subscriptions: vec![color_sub, size_sub, zoom_sub, appearance_sub],
         };
         // give the canvas the keyboard focus at startup so that the shortcuts work at once
         window.focus(&app.focus_handle, cx);
+
+        // MCP options from the command line: the token becomes the dialog's default,
+        // and a given port starts the server right away
+        app.mcp_default_token = mcp_options.token.clone();
+        if let Some(port) = mcp_options.port {
+            let token = mcp_options.token.unwrap_or_else(mcp::generate_token);
+            let started = mcp::parse_settings(&port.to_string(), &token)
+                .and_then(|(port, token)| app.start_mcp_server(port, token, cx));
+            if let Err(message) = started {
+                show_error(&message);
+            }
+        }
 
         // open the file given on the command line (a fresh document has no changes,
         // so no confirmation dialog appears)
@@ -298,20 +319,6 @@ impl Application {
             })
             .detach();
         }
-
-        // requests from the MCP server (opt-in with --mcp-port)
-        if let Some(mut rx) = mcp_rx {
-            cx.spawn(async move |this, cx| {
-                while let Some(req) = rx.next().await {
-                    let alive = this.update_in(cx, |this, window, cx| this.handle_mcp(req, window, cx));
-                    if alive.is_err() {
-                        break; // the view is gone
-                    }
-                }
-            })
-            .detach();
-        }
-
         app
     }
 
@@ -1367,6 +1374,184 @@ impl Application {
 
     // -- MCP -----------------------------------------------------------------
 
+    fn start_mcp_server(&mut self, port: u16, token: String, cx: &mut Context<Self>) -> Result<(), String> {
+        if self.mcp_server.is_some() {
+            return Err("The MCP server is already running.".to_string());
+        }
+        let rx = mcp::start(port, token.clone())
+            .map_err(|e| format!("Failed to start the MCP server on 127.0.0.1:{port}: {e}"))?;
+        self.spawn_mcp_loop(rx, cx);
+        self.mcp_server = Some(McpEndpoint { port, token });
+        cx.notify();
+        Ok(())
+    }
+
+    // run the requests of the MCP server on the UI thread
+    fn spawn_mcp_loop(&mut self, mut rx: UnboundedReceiver<McpRequest>, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            while let Some(req) = rx.next().await {
+                let alive = this.update_in(cx, |this, window, cx| this.handle_mcp(req, window, cx));
+                if alive.is_err() {
+                    break; // the view is gone
+                }
+            }
+        })
+            .detach();
+    }
+
+    fn open_mcp_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // a running server shows its own settings, otherwise the defaults are offered
+        let (port, token) = match &self.mcp_server {
+            Some(endpoint) => (endpoint.port, endpoint.token.clone()),
+            None => (
+                mcp::DEFAULT_PORT,
+                self.mcp_default_token.get_or_insert_with(mcp::generate_token).clone(),
+            ),
+        };
+
+        let app = cx.entity();
+        let port_input = cx.new(|cx| InputState::new(window, cx).default_value(port.to_string()));
+        let token_input = cx.new(|cx| InputState::new(window, cx).default_value(token));
+
+        // the examples follow the typed values, so repaint the dialog whenever an input changes
+        self.mcp_dialog_subs = [&port_input, &token_input]
+            .into_iter()
+            .map(|input| {
+                cx.subscribe_in(input, window, |_, _, ev: &InputEvent, window, _| {
+                    if matches!(ev, InputEvent::Change { .. }) {
+                        window.refresh();
+                    }
+                })
+            })
+            .collect();
+
+        let initial_focus = Cell::new(true);
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let running = app.read(cx).mcp_server.clone();
+            let is_running = running.is_some();
+            if initial_focus.replace(false) && !is_running {
+                port_input.focus_handle(cx).focus(window, cx);
+            }
+
+            // Shared by the Start button and the Enter key.
+            let start: Rc<dyn Fn(&mut Window, &mut App)> = {
+                let app = app.clone();
+                let port_input = port_input.clone();
+                let token_input = token_input.clone();
+                Rc::new(move |window: &mut Window, cx: &mut App| {
+                    let port_text = port_input.read(cx).value().to_string();
+                    let token_text = token_input.read(cx).value().to_string();
+                    let (port, token) = match mcp::parse_settings(&port_text, &token_text) {
+                        Ok(settings) => settings,
+                        Err(message) => {
+                            show_error(&message);
+                            return;
+                        }
+                    };
+                    match app.update(cx, |this, cx| this.start_mcp_server(port, token, cx)) {
+                        // repaint: the inputs become disabled and the status changes
+                        Ok(()) => window.refresh(),
+                        Err(message) => show_error(&message),
+                    }
+                })
+            };
+
+            // the examples show the running settings, or what is typed so far
+            let (port_text, token_text) = match &running {
+                Some(endpoint) => (endpoint.port.to_string(), endpoint.token.clone()),
+                None => (
+                    port_input.read(cx).value().to_string(),
+                    token_input.read(cx).value().to_string(),
+                ),
+            };
+            let command = mcp::claude_code_command(&port_text, &token_text);
+            let json = mcp::config_json(&port_text, &token_text);
+            let code_bg = cx.theme().secondary;
+
+            let status = match &running {
+                Some(endpoint) => format!("Running on {}", mcp::endpoint_url(&endpoint.port.to_string())),
+                None => "Not running. The server listens on 127.0.0.1 only, and every request needs the token."
+                    .to_string(),
+            };
+
+            let row = |label: &'static str, input: &Entity<InputState>| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().w(px(56.)).text_sm().child(label))
+                    .child(div().flex_1().child(Input::new(input).disabled(is_running)))
+            };
+
+            // text in a dialog cannot be selected, so every example has a Copy button
+            let example = |id: &'static str, title: &'static str, text: String| {
+                let to_copy = text.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().child(title))
+                            .child(
+                                Button::new(id).xsmall().label("Copy").on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(to_copy.clone()));
+                                }),
+                            ),
+                    )
+                    .child(div().p(px(8.)).rounded(px(4.)).bg(code_bg).text_xs().child(text))
+            };
+
+            let mut footer = DialogFooter::new();
+            if !is_running {
+                let start = start.clone();
+                footer = footer.child(
+                    Button::new("mcp-start")
+                        .primary()
+                        .label("Start")
+                        .on_click(move |_, window, cx| start(window, cx)),
+                );
+            }
+            footer = footer.child(
+                Button::new("mcp-close")
+                    .label("Close")
+                    .on_click(|_, window, cx| window.close_dialog(cx)),
+            );
+
+            let start_for_enter = start.clone();
+            dialog
+                .title("MCP server")
+                .w(px(560.))
+                // Enter in an input starts the server; once it runs, Enter closes the dialog
+                .on_ok(move |_, window, cx| {
+                    if is_running {
+                        return true;
+                    }
+                    start_for_enter(window, cx);
+                    false
+                })
+                .on_cancel(|_, _, _| true)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(div().text_xs().child(status))
+                        .child(row("Port", &port_input))
+                        .child(row("Token", &token_input))
+                        .child(example("mcp-copy-command", "Claude Code", command))
+                        .child(example("mcp-copy-json", "mcp_config.json", json)),
+                )
+                .footer(footer)
+        });
+    }
+
     fn handle_mcp(&mut self, req: McpRequest, window: &mut Window, cx: &mut Context<Self>) {
         let McpRequest { op, reply } = req;
         // the caller gave up waiting (timeout): do not run the operation late
@@ -1503,6 +1688,16 @@ impl Application {
                 } else {
                     Err("nothing to redo".to_string())
                 }
+            }
+            McpOp::Resize { width, height } => match self.doc.trim(width, height) {
+                Ok(true) => {
+                    // also refreshes the size inputs and the scroll position
+                    self.after_history_change(window, cx);
+                    Ok(McpReply::Done)
+                }
+                // already that size: nothing to do
+                Ok(false) => Ok(McpReply::Done),
+                Err(e) => Err(e.to_string()),
             }
         }
     }
@@ -1952,6 +2147,16 @@ impl Application {
             .map(|s| format!("{} × {} px", s.w, s.h))
             .unwrap_or_default();
 
+        // the MCP button is highlighted while the server runs
+        let mut mcp_button = Button::new("btn-mcp")
+            .xsmall()
+            .label("MCP")
+            .tooltip("MCP server")
+            .on_click(cx.listener(|this, _, window, cx| this.open_mcp_dialog(window, cx)));
+        if self.mcp_server.is_some() {
+            mcp_button = mcp_button.primary();
+        }
+
         let fit_button = Button::new("btn-fit")
             .xsmall()
             .icon(IconName::ScanSquare)
@@ -1976,6 +2181,7 @@ impl Application {
             .bg(cx.theme().secondary)
             .border_t_1()
             .border_color(cx.theme().sidebar_border)
+            .child(mcp_button)
             // image size and cursor position, selection size
             .child(div().w(px(110.)).text_xs().child(size_text))
             .child(div().w(px(80.)).text_xs().child(cursor_text))
@@ -2296,22 +2502,12 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-/// Start the MCP server; errors are reported with a dialog (the release build has no console).
-fn start_mcp(port: u16, token: Option<String>) -> Option<UnboundedReceiver<McpRequest>> {
-    // the token may come from the environment, which keeps it out of the process list
-    let token = token.or_else(|| std::env::var("MIN_PAINT_MCP_TOKEN").ok()).unwrap_or_default();
-    if token.len() < 16 {
-        show_error("The MCP server needs an access token of at least 16 characters \
-                    (--mcp-token or the MIN_PAINT_MCP_TOKEN environment variable).");
-        return None;
-    }
-    match mcp::start(port, token) {
-        Ok(rx) => Some(rx),
-        Err(e) => {
-            show_error(&format!("Failed to start the MCP server on 127.0.0.1:{port}: {e}"));
-            None
-        }
-    }
+/// MCP settings given at startup (command line or environment).
+#[derive(Clone, Default)]
+struct McpOptions {
+    // start the server right away on this port
+    port: Option<u16>,
+    token: Option<String>,
 }
 
 fn main() {
@@ -2329,10 +2525,13 @@ fn main() {
         }
     };
     let Args { initial_file, mcp_port, mcp_token } = args;
-
-    // MCP requests are forwarded to the UI through a channel (opt-in)
-    let mcp_rx = mcp_port.and_then(|port| start_mcp(port, mcp_token));
-    let mcp_rx = Rc::new(RefCell::new(mcp_rx));
+    let mcp_options = McpOptions {
+        port: mcp_port,
+        // the token may also come from the environment, which keeps it out of the process list
+        token: mcp_token
+            .or_else(|| std::env::var("MIN_PAINT_MCP_TOKEN").ok())
+            .filter(|t| !t.is_empty()),
+    };
 
     // open requests from the OS (Finder) are forwarded to the UI through a channel;
     // events that arrive before the window exists are buffered
@@ -2358,8 +2557,7 @@ fn main() {
         let window_options = window_options(cx);
         open_window(window_options, cx, move |window, cx| {
             let open_rx = open_rx.borrow_mut().take();
-            let mcp_rx = mcp_rx.borrow_mut().take();
-            cx.new(|cx| Application::new(initial_file.clone(), open_rx, mcp_rx, window, cx))
+            cx.new(|cx| Application::new(initial_file.clone(), open_rx, mcp_options.clone(), window, cx))
         })
         .expect("failed to open window");
 

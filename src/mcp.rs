@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use base64::Engine as _;
 use futures::channel::{mpsc, oneshot};
+use futures::future::{select, Either};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -57,6 +58,7 @@ pub enum McpOp {
     Text { text: String, at: (i32, i32), font_size: f32, font: Option<String>, style: Style },
     Undo,
     Redo,
+    Resize { width: usize, height: usize },
 }
 
 impl McpOp {
@@ -165,6 +167,14 @@ struct TextParams {
     antialias: Option<bool>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ResizeParams {
+    /// New canvas width in pixels (1-4096).
+    width: i32,
+    /// New canvas height in pixels (1-4096).
+    height: i32,
+}
+
 // -- server ---------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -268,6 +278,13 @@ impl PaintServer {
     #[tool(description = "Redo the last undone edit. Fails when there is nothing to redo.")]
     async fn redo(&self) -> Result<CallToolResult, McpError> {
         self.run(Ok(McpOp::Redo)).await
+    }
+
+    #[tool(description = "Resize the canvas. The top-left corner stays in place: a smaller size crops \
+                      the right and bottom edges, a larger size adds a transparent area there. \
+                      One undo step.")]
+    async fn resize_canvas(&self, Parameters(p): Parameters<ResizeParams>) -> Result<CallToolResult, McpError> {
+        self.run(build_resize(p)).await
     }
 }
 
@@ -393,6 +410,82 @@ fn build_text(p: TextParams) -> Result<McpOp, String> {
     }
     let style = build_style(None, p.color.as_deref(), None, p.antialias)?;
     Ok(McpOp::Text { text: p.text, at, font_size, font: p.font, style })
+}
+
+fn build_resize(p: ResizeParams) -> Result<McpOp, String> {
+    let max = MAX_CANVAS_SIZE as i32;
+    for (name, value) in [("width", p.width), ("height", p.height)] {
+        if !(1..=max).contains(&value) {
+            return Err(format!("{name} must be between 1 and {max}"));
+        }
+    }
+    Ok(McpOp::Resize { width: p.width as usize, height: p.height as usize })
+}
+
+// -- settings and registration examples (used by the settings dialog) ---------------
+
+pub const DEFAULT_PORT: u16 = 8787;
+/// the name the server is registered under in MCP clients
+pub const SERVER_NAME: &str = "min-paint";
+const MIN_PORT: u16 = 1024;
+const MIN_TOKEN_LEN: usize = 16;
+const MAX_TOKEN_LEN: usize = 128;
+
+/// Where the running server listens and the token it requires.
+#[derive(Clone)]
+pub struct McpEndpoint {
+    pub port: u16,
+    pub token: String,
+}
+
+/// A random token (32 hex digits) for the dialog's default value.
+/// Returns an empty string when the OS has no random number generator.
+pub fn generate_token() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        return String::new();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Validate the values typed in the dialog.
+pub fn parse_settings(port: &str, token: &str) -> Result<(u16, String), String> {
+    let port: u16 = port
+        .trim()
+        .parse()
+        .ok()
+        .filter(|p| *p >= MIN_PORT)
+        .ok_or_else(|| format!("The port must be a number between {MIN_PORT} and 65535."))?;
+    // only characters that need no escaping in a header, a shell command or JSON
+    let token = token.trim();
+    let valid_char = |c: char| c.is_ascii_alphanumeric() || "-._~".contains(c);
+    if !(MIN_TOKEN_LEN..=MAX_TOKEN_LEN).contains(&token.len()) || !token.chars().all(valid_char) {
+        return Err(format!(
+            "The token must be {MIN_TOKEN_LEN} to {MAX_TOKEN_LEN} characters: \
+             letters, digits, '-', '.', '_' or '~'."
+        ));
+    }
+    Ok((port, token.to_string()))
+}
+
+pub fn endpoint_url(port: &str) -> String {
+    format!("http://127.0.0.1:{port}/mcp")
+}
+
+/// Command that registers the server in Claude Code.
+pub fn claude_code_command(port: &str, token: &str) -> String {
+    format!(
+        "claude mcp add --transport http {SERVER_NAME} {} --header \"Authorization: Bearer {token}\"",
+        endpoint_url(port)
+    )
+}
+
+/// Entry for the `mcp_config.json` of clients that read `mcpServers` with `url` and `headers`.
+pub fn config_json(port: &str, token: &str) -> String {
+    format!(
+        "{{\n  \"mcpServers\": {{\n    \"{SERVER_NAME}\": {{\n      \"url\": \"{}\",\n      \"headers\": {{\n        \"Authorization\": \"Bearer {token}\"\n      }}\n    }}\n  }}\n}}",
+        endpoint_url(port)
+    )
 }
 
 // -- startup --------------------------------------------------------------------

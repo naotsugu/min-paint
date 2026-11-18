@@ -3812,6 +3812,7 @@ dependencies = [
  "base64 0.23.1",
  "cosmic-text",
  "futures",
+ "getrandom 0.3.4",
  "gpui-kit",
  "image",
  "rfd",
