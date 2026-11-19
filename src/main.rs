@@ -29,7 +29,7 @@ use model::{
 };
 
 mod mcp;
-use mcp::{CanvasInfo, McpEndpoint, McpOp, McpReply, McpRequest, Style};
+use mcp::{CanvasInfo, McpOp, McpReply, McpRequest, Style};
 
 // Windows-only native clipboard access (CF_DIB / CF_DIBV5 / "PNG")
 #[cfg(windows)]
@@ -147,8 +147,10 @@ pub struct Application {
     xs_cache: Vec<i32>,
     ys_cache: Vec<i32>,
     focus_handle: FocusHandle,
-    // MCP server: Some once started (it keeps running until the application quits)
-    mcp_server: Option<McpEndpoint>,
+    // MCP server: Some while it runs (drop the handle to stop it)
+    mcp_server: Option<mcp::McpServer>,
+    // the values offered by the dialog: the ones used last, or the defaults
+    mcp_default_port: u16,
     // default token of the dialog, generated on first use and kept for the session
     mcp_default_token: Option<String>,
     // repaint the open dialog when its inputs change (replaced every time the dialog opens)
@@ -278,6 +280,7 @@ impl Application {
             ys_cache: Vec::new(),
             focus_handle: cx.focus_handle(),
             mcp_server: None,
+            mcp_default_port: mcp::DEFAULT_PORT,
             mcp_default_token: None,
             mcp_dialog_subs: Vec::new(),
             _subscriptions: vec![color_sub, size_sub, zoom_sub, appearance_sub],
@@ -289,7 +292,7 @@ impl Application {
         // and a given port starts the server right away
         app.mcp_default_token = mcp_options.token.clone();
         if let Some(port) = mcp_options.port {
-            let token = mcp_options.token.unwrap_or_else(mcp::generate_token);
+            let token = mcp_options.token.unwrap_or_else(mcp::default_token);
             let started = mcp::parse_settings(&port.to_string(), &token)
                 .and_then(|(port, token)| app.start_mcp_server(port, token, cx));
             if let Err(message) = started {
@@ -1378,12 +1381,23 @@ impl Application {
         if self.mcp_server.is_some() {
             return Err("The MCP server is already running.".to_string());
         }
-        let rx = mcp::start(port, token.clone())
+        let (server, rx) = mcp::start(port, token.clone())
             .map_err(|e| format!("Failed to start the MCP server on 127.0.0.1:{port}: {e}"))?;
         self.spawn_mcp_loop(rx, cx);
-        self.mcp_server = Some(McpEndpoint { port, token });
+        self.mcp_server = Some(server);
+        // the next dialog offers the values that were used last
+        self.mcp_default_port = port;
+        self.mcp_default_token = Some(token);
         cx.notify();
         Ok(())
+    }
+
+    fn stop_mcp_server(&mut self, cx: &mut Context<Self>) {
+        // dropping the handle stops the server and releases the port;
+        // the request loop ends by itself when the channel closes
+        if self.mcp_server.take().is_some() {
+            cx.notify();
+        }
     }
 
     // run the requests of the MCP server on the UI thread
@@ -1402,10 +1416,10 @@ impl Application {
     fn open_mcp_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // a running server shows its own settings, otherwise the defaults are offered
         let (port, token) = match &self.mcp_server {
-            Some(endpoint) => (endpoint.port, endpoint.token.clone()),
+            Some(server) => (server.endpoint.port, server.endpoint.token.clone()),
             None => (
-                mcp::DEFAULT_PORT,
-                self.mcp_default_token.get_or_insert_with(mcp::generate_token).clone(),
+                self.mcp_default_port,
+                self.mcp_default_token.get_or_insert_with(mcp::default_token).clone(),
             ),
         };
 
@@ -1428,7 +1442,7 @@ impl Application {
         let initial_focus = Cell::new(true);
 
         window.open_dialog(cx, move |dialog, window, cx| {
-            let running = app.read(cx).mcp_server.clone();
+            let running = app.read(cx).mcp_server.as_ref().map(|s| s.endpoint.clone());
             let is_running = running.is_some();
             if initial_focus.replace(false) && !is_running {
                 port_input.focus_handle(cx).focus(window, cx);
@@ -1509,7 +1523,18 @@ impl Application {
             };
 
             let mut footer = DialogFooter::new();
-            if !is_running {
+            if is_running {
+                let app = app.clone();
+                footer = footer.child(
+                    Button::new("mcp-stop")
+                        .label("Stop")
+                        .on_click(move |_, window, cx| {
+                            app.update(cx, |this, cx| this.stop_mcp_server(cx));
+                            // repaint: the inputs become editable again
+                            window.refresh();
+                        }),
+                );
+            } else {
                 let start = start.clone();
                 footer = footer.child(
                     Button::new("mcp-start")

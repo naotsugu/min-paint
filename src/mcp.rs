@@ -7,7 +7,9 @@
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::time::Duration;
-
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
@@ -448,6 +450,36 @@ pub fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Default token of the dialog. It is derived from the name and the creation time of the
+/// home directory, so it is the same on every run and clients need to be registered only once.
+/// Falls back to a random token when the home directory or its creation time is unknown.
+pub fn default_token() -> String {
+    derive_token().unwrap_or_else(generate_token)
+}
+
+fn derive_token() -> Option<String> {
+    let home = home_dir()?;
+    let name = home.file_name()?.to_string_lossy().into_owned();
+    // not every platform / file system records a creation time
+    let created = std::fs::metadata(&home).ok()?.created().ok()?;
+    let secs = created.duration_since(UNIX_EPOCH).ok()?.as_secs();
+
+    let mut hasher = Sha256::new();
+    // the version tag lets a future change of this scheme produce different tokens
+    hasher.update(b"min-paint-mcp-token-v1");
+    hasher.update([0u8]);
+    hasher.update(name.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(secs.to_be_bytes());
+    // 16 bytes = 32 hex digits, which `parse_settings` accepts
+    Some(hasher.finalize().iter().take(16).map(|b| format!("{b:02x}")).collect())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_dir())
+}
+
 /// Validate the values typed in the dialog.
 pub fn parse_settings(port: &str, token: &str) -> Result<(u16, String), String> {
     let port: u16 = port
@@ -490,15 +522,41 @@ pub fn config_json(port: &str, token: &str) -> String {
 
 // -- startup --------------------------------------------------------------------
 
+/// A running server. Dropping it stops the server and releases the port.
+pub struct McpServer {
+    pub endpoint: McpEndpoint,
+    stop: Option<oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        // tell the server thread to stop
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        // wait until the port is released, so that the server can be started again at once
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Start the server on 127.0.0.1:`port`. Requests need `Authorization: Bearer <token>`.
-/// Returns the receiver that the UI has to drain; the port is bound before this returns,
+/// Returns the handle (drop it to stop the server) and the receiver that the UI has to drain;
+/// the receiver ends by itself when the server stops. The port is bound before this returns,
 /// so that a failure (for example "port in use") can be reported to the user.
-pub fn start(port: u16, token: String) -> std::io::Result<mpsc::UnboundedReceiver<McpRequest>> {
+pub fn start(
+    port: u16,
+    token: String,
+) -> std::io::Result<(McpServer, mpsc::UnboundedReceiver<McpRequest>)> {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
     listener.set_nonblocking(true)?;
     let (tx, rx) = mpsc::unbounded();
+    let (stop, stop_rx) = oneshot::channel::<()>();
+    let endpoint = McpEndpoint { port, token: token.clone() };
 
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("mcp-server".into())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -508,11 +566,23 @@ pub fn start(port: u16, token: String) -> std::io::Result<mpsc::UnboundedReceive
                     return;
                 }
             };
-            if let Err(e) = runtime.block_on(serve(listener, tx, token)) {
+            let result = runtime.block_on(async move {
+                let server = std::pin::pin!(serve(listener, tx, token));
+                match select(server, stop_rx).await {
+                    // the server ended by itself
+                    Either::Left((result, _)) => result,
+                    // stop requested
+                    Either::Right(_) => Ok(()),
+                }
+            });
+            if let Err(e) = result {
                 eprintln!("mcp: server stopped: {e}");
             }
+            // dropping the runtime cancels the open connections
+            drop(runtime);
         })?;
-    Ok(rx)
+
+    Ok((McpServer { endpoint, stop: Some(stop), thread: Some(thread) }, rx))
 }
 
 async fn serve(
