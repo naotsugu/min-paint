@@ -1532,6 +1532,7 @@ impl Application {
                             app.update(cx, |this, cx| this.stop_mcp_server(cx));
                             // repaint: the inputs become editable again
                             window.refresh();
+                            window.close_dialog(cx);
                         }),
                 );
             } else {
@@ -2175,11 +2176,13 @@ impl Application {
         // the MCP button is highlighted while the server runs
         let mut mcp_button = Button::new("btn-mcp")
             .xsmall()
+            .icon(IconName::BotOff)
             .label("MCP")
             .tooltip("MCP server")
             .on_click(cx.listener(|this, _, window, cx| this.open_mcp_dialog(window, cx)));
         if self.mcp_server.is_some() {
-            mcp_button = mcp_button.primary();
+            mcp_button = mcp_button.icon(IconName::Bot)
+                .bg(cx.theme().accent);
         }
 
         let fit_button = Button::new("btn-fit")
