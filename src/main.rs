@@ -1484,9 +1484,10 @@ impl Application {
             let code_bg = cx.theme().secondary;
 
             let status = match &running {
-                Some(endpoint) => format!("Running on {}", mcp::endpoint_url(&endpoint.port.to_string())),
-                None => "Not running. The server listens on 127.0.0.1 only, and every request needs the token."
-                    .to_string(),
+                Some(endpoint) => t!("dialog.mcp.status_running",
+                    url = mcp::endpoint_url(&endpoint.port.to_string())
+                ).to_string(),
+                None => t!("dialog.mcp.status_stopped").to_string(),
             };
 
             let row = |label: &'static str, input: &Entity<InputState>| {
@@ -1552,7 +1553,7 @@ impl Application {
 
             let start_for_enter = start.clone();
             dialog
-                .title("MCP server")
+                .title(t!("dialog.mcp.title"))
                 .w(px(560.))
                 // Enter in an input starts the server; once it runs, Enter closes the dialog
                 .on_ok(move |_, window, cx| {

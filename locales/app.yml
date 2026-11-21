@@ -32,6 +32,27 @@ dialog.trim.msg:
   fr: "De 1 à %{max_size} px.\nL'image est rognée à partir du coin supérieur gauche de la sélection ; les zones hors de l'image deviennent transparentes."
   de: "1 bis %{max_size} px.\nDas Bild wird ab der oberen linken Ecke der Auswahl zugeschnitten; Bereiche außerhalb des Bildes werden transparent."
 
+dialog.mcp.title:
+  en: "MCP server"
+dialog.mcp.status_running:
+  en: "Running on %{url}"
+  ja: "%{url} で実行中"
+  zh-CN: "正在 %{url} 上运行"
+  zh-TW: "正在 %{url} 上執行"
+  ko: "%{url} 에서 실행 중"
+  es: "En ejecución en %{url}"
+  fr: "En cours d'exécution sur %{url}"
+  de: "Läuft auf %{url}"
+dialog.mcp.status_stopped:
+  en: "Not running. The server listens on 127.0.0.1 only, and every request needs the token."
+  ja: "停止中. サーバーは 127.0.0.1 のみで待ち受け, すべてのリクエストにトークンが必要です."
+  zh-CN: "未运行. 服务器仅监听 127.0.0.1, 所有请求都需要令牌."
+  zh-TW: "未執行. 伺服器僅監聽 127.0.0.1, 所有請求都需要權杖."
+  ko: "실행 중이 아닙니다. 서버는 127.0.0.1 에서만 수신하며 모든 요청에 토큰이 필요합니다."
+  es: "No está en ejecución. El servidor solo escucha en 127.0.0.1 y cada solicitud requiere el token."
+  fr: "Non démarré. Le serveur écoute uniquement sur 127.0.0.1 et chaque requête nécessite le jeton."
+  de: "Nicht gestartet. Der Server lauscht nur auf 127.0.0.1, und jede Anfrage benötigt das Token."
+
 dialog.resize.title:
   en: "Resize canvas"
 dialog.resize.msg:
