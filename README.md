@@ -1,6 +1,6 @@
 # min-paint
 
-A simple paint application similar to classic MS Paint — built for people who hate the new Windows 11 Paint.
+A simple paint application similar to classic MS Paint with MCP — built for people who hate the new Windows 11 Paint.
 
 ![screenshot1](docs/screenshot-01.png)
 
