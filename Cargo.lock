@@ -3778,7 +3778,7 @@ dependencies = [
 
 [[package]]
 name = "min-paint"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
