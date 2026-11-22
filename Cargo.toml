@@ -4,7 +4,6 @@ version = "0.2.3"
 edition = "2024"
 description = "Minimal paint application"
 authors = ["Naotsugu Kobayashi <naotsugukobayashi@gmail.com>"]
-homepage = "https://github.com/naotsugu/min-paint"
 documentation = "https://github.com/naotsugu/min-paint"
 repository = "https://github.com/naotsugu/min-paint"
 license = "Apache-2.0"
@@ -13,7 +12,7 @@ license = "Apache-2.0"
 gpui-kit = "0.8.0"
 image = { version = "0.25.10", default-features = false,
     features = ["png", "bmp", "gif", "ico", "tiff", "jpeg", "webp"] }
-rfd = "0.17.2"
+rfd = "0.18"
 cosmic-text = "0.19.0"
 futures = "0.3.34"
 rust-i18n = "4"
@@ -26,8 +25,8 @@ tokio = { version = "1", features = ["rt", "net", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.23"
-sha2 = "0.10"
-getrandom = "0.3"
+sha2 = "0.11"
+getrandom = "0.4"
 
 [build-dependencies]
 winresource = "0.1"

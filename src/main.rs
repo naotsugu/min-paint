@@ -1298,14 +1298,14 @@ impl Application {
         }
     }
 
-    fn handle_scroll_wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_scroll_wheel(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_saving {
             return;
         }
         let delta = event.delta.pixel_delta(px(20.));
 
         // Ctrl + wheel: zoom around the mouse pointer instead of scrolling
-        if event.modifiers.secondary() {
+        if event.modifiers.secondary(cx) {
             let origin = self.viewport_origin.get();
             let anchor = (
                 f32::from(event.position.x - origin.x),
@@ -2295,7 +2295,7 @@ impl Render for Application {
             .on_mouse_down(MouseButton::Right, cx.listener(Self::handle_right_mouse_down))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::handle_right_mouse_up))
             .on_mouse_up_out(MouseButton::Right, cx.listener(Self::handle_right_mouse_up))
-            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
+            .on_scroll(cx.listener(Self::handle_scroll_wheel))
             .on_drop(cx.listener(Self::handle_drop))
             // the image is generated at device resolution, so it is shown 1:1
             .children(image.map(|image| {
